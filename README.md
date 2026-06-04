@@ -20,8 +20,8 @@ http://localhost:8000
 
 1. Uses Leaflet for the map.
 2. Uses OpenStreetMap raster tiles for the base map.
-3. Splits the visible map area into reusable scan tiles and fetches OSM features from Overpass.
-4. Keeps scanned tiles in memory while the tab is open, so overlapping future scans reuse existing data.
+3. Fetches one padded Overpass scan for the visible map area when it fits public-service limits.
+4. Uses fixed 5 km scan tiles only for larger areas, and keeps scan results in memory while the tab is open.
 5. Converts selected walking/biking layers into feature buckets.
 6. Parses features and scores a physically even grid of map points from 0 to 100, using a Web Worker when served over HTTP.
 7. Renders a red-to-green score overlay directly from those scores.

@@ -9,10 +9,12 @@ const OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter";
 const EARTH_RADIUS_M = 6371008.8;
 const DENSIFY_STEP_M = 45;
 const GRID_TARGET_POINTS = 42;
-const SCAN_TILE_LAT_DEG = 0.12;
-const SCAN_TILE_LNG_DEG = 0.18;
-const SCAN_PADDING_M = 750;
-const MAX_SCAN_TILES = 90;
+const SCAN_TILE_SIZE_M = 5000;
+const SCAN_PADDING_EXTRA_M = 180;
+const MAX_SINGLE_SCAN_AREA_DEG2 = 0.08;
+const MAX_SINGLE_SCAN_LAT_SPAN_DEG = 0.30;
+const MAX_SINGLE_SCAN_LNG_SPAN_DEG = 0.50;
+const MAX_SCAN_TILES = 180;
 const SCAN_TILE_DELAY_MS = 450;
 const OVERPASS_RETRY_DELAYS_MS = [1800, 4500];
 
@@ -139,6 +141,8 @@ const layerDefinitions = {
 
 const walkPreset = ["walk-network", "walk-crossings", "walk-destinations", "walk-comfort"];
 const bikePreset = ["bike-network", "bike-low-stress", "bike-parking", "bike-calm", "bike-parks-trails", "bike-stress"];
+const MAX_SCORE_RADIUS_M = Math.max(...Object.values(layerDefinitions).map((layer) => layer.radius || 0));
+const SCAN_PADDING_M = MAX_SCORE_RADIUS_M + SCAN_PADDING_EXTRA_M;
 
 function setStatus(message, level = "") {
   statusEl.textContent = message;
@@ -178,31 +182,77 @@ function expandedBboxMeters(bbox, meters) {
   };
 }
 
+function bboxSpan(bbox) {
+  return {
+    lat: Math.abs(bbox.north - bbox.south),
+    lng: Math.abs(bbox.east - bbox.west),
+  };
+}
+
+function bboxAreaDeg2(bbox) {
+  const span = bboxSpan(bbox);
+  return span.lat * span.lng;
+}
+
+function canUseSingleScan(bbox) {
+  const span = bboxSpan(bbox);
+  return bboxAreaDeg2(bbox) <= MAX_SINGLE_SCAN_AREA_DEG2 &&
+    span.lat <= MAX_SINGLE_SCAN_LAT_SPAN_DEG &&
+    span.lng <= MAX_SINGLE_SCAN_LNG_SPAN_DEG;
+}
+
+function roundedBboxKey(bbox) {
+  return [bbox.south, bbox.west, bbox.north, bbox.east]
+    .map((value) => value.toFixed(5))
+    .join(":");
+}
+
+function metersToLatDegrees(meters) {
+  return (meters / EARTH_RADIUS_M) * (180 / Math.PI);
+}
+
+function lngDegreesForMeters(meters, lat) {
+  return metersToLatDegrees(meters) / Math.max(0.2, Math.cos(degToRad(lat)));
+}
+
 function scanTilesForBbox(bbox) {
   const expanded = expandedBboxMeters(bbox, SCAN_PADDING_M);
-  const minLatIndex = Math.floor(expanded.south / SCAN_TILE_LAT_DEG);
-  const maxLatIndex = Math.floor((expanded.north - 1e-10) / SCAN_TILE_LAT_DEG);
-  const minLngIndex = Math.floor(expanded.west / SCAN_TILE_LNG_DEG);
-  const maxLngIndex = Math.floor((expanded.east - 1e-10) / SCAN_TILE_LNG_DEG);
+  if (canUseSingleScan(expanded)) {
+    return {
+      expanded,
+      mode: "single",
+      tiles: [{ key: `scan-v4:single:${roundedBboxKey(expanded)}`, bbox: expanded }],
+    };
+  }
+
+  const latSizeDeg = metersToLatDegrees(SCAN_TILE_SIZE_M);
+  const minLatIndex = Math.floor(expanded.south / latSizeDeg);
+  const maxLatIndex = Math.floor((expanded.north - 1e-10) / latSizeDeg);
   const tiles = [];
 
   for (let latIndex = minLatIndex; latIndex <= maxLatIndex; latIndex++) {
+    const south = latIndex * latSizeDeg;
+    const north = south + latSizeDeg;
+    const centerLat = (south + north) / 2;
+    const lngSizeDeg = lngDegreesForMeters(SCAN_TILE_SIZE_M, centerLat);
+    const minLngIndex = Math.floor(expanded.west / lngSizeDeg);
+    const maxLngIndex = Math.floor((expanded.east - 1e-10) / lngSizeDeg);
+
     for (let lngIndex = minLngIndex; lngIndex <= maxLngIndex; lngIndex++) {
-      const south = latIndex * SCAN_TILE_LAT_DEG;
-      const west = lngIndex * SCAN_TILE_LNG_DEG;
+      const west = lngIndex * lngSizeDeg;
       tiles.push({
-        key: `scan-v3:${latIndex}:${lngIndex}`,
+        key: `scan-v4:${latIndex}:${lngIndex}`,
         bbox: {
           south,
           west,
-          north: south + SCAN_TILE_LAT_DEG,
-          east: west + SCAN_TILE_LNG_DEG,
+          north,
+          east: west + lngSizeDeg,
         },
       });
     }
   }
 
-  return { expanded, tiles };
+  return { expanded, mode: "tiled", tiles };
 }
 
 function scanPlanTooLarge(plan) {
@@ -255,7 +305,7 @@ async function fetchOsmData(bbox, signal) {
 
     const canRetry = [429, 502, 503, 504].includes(response.status) && attempt < OVERPASS_RETRY_DELAYS_MS.length;
     if (!canRetry) {
-      throw new Error(`Overpass returned ${response.status}. Already scanned tiles remain cached; try again in a minute or zoom in slightly.`);
+      throw new Error(`Overpass returned ${response.status}. Already saved scan results remain cached; try again in a minute or zoom in slightly.`);
     }
 
     const retryAfter = Number(response.headers.get("Retry-After"));
@@ -283,7 +333,7 @@ function wait(ms, signal) {
 async function scanOsmData(bbox, signal) {
   const plan = scanTilesForBbox(bbox);
   if (scanPlanTooLarge(plan)) {
-    throw new Error(`This view needs ${plan.tiles.length} scan tiles. Zoom in until it needs ${MAX_SCAN_TILES} or fewer tiles, then calculate again.`);
+    throw new Error(`This view needs ${plan.tiles.length} fixed 5 km scan requests. Zoom in until it needs ${MAX_SCAN_TILES} or fewer requests, then calculate again.`);
   }
 
   const missingTiles = plan.tiles.filter((tile) => !scanCache.has(tile.key));
@@ -291,9 +341,9 @@ async function scanOsmData(bbox, signal) {
     if (signal.aborted) throw new DOMException("Scan aborted", "AbortError");
     const tile = missingTiles[i];
     setStatus(
-      `Scanning visible area with reusable tiles…\n` +
-      `Tile ${i + 1} of ${missingTiles.length} new; ${plan.tiles.length - missingTiles.length} reused from this tab.\n` +
-      `Total tiles for this view: ${plan.tiles.length}.`
+      `Scanning visible area with ${plan.mode === "single" ? "one padded request" : "fixed 5 km reusable tiles"}…\n` +
+      `Request ${i + 1} of ${missingTiles.length} new; ${plan.tiles.length - missingTiles.length} reused from this tab.\n` +
+      `Total scan requests for this view: ${plan.tiles.length}.`
     );
     const osmJson = await fetchOsmData(tile.bbox, signal);
     scanCache.set(tile.key, {
@@ -324,6 +374,7 @@ function mergeScanTiles(tiles, fetchedTileCount) {
   return {
     osmJson: { elements: [...elementsByKey.values()] },
     tileCount: tiles.length,
+    mode: tiles.length === 1 ? "single" : "tiled",
     fetchedTileCount,
     reusedTileCount: tiles.length - fetchedTileCount,
     rawElementCount,
@@ -1098,7 +1149,7 @@ async function calculate() {
   const bbox = getBbox();
   const scanPlan = scanTilesForBbox(bbox);
   if (scanPlanTooLarge(scanPlan)) {
-    setStatus(`This view needs ${scanPlan.tiles.length} scan tiles, which is larger than the city-sized limit of ${MAX_SCAN_TILES}. Zoom in a bit and calculate again.`, "warn");
+    setStatus(`This view needs ${scanPlan.tiles.length} fixed 5 km scan requests, which is larger than the city-sized limit of ${MAX_SCAN_TILES}. Zoom in a bit and calculate again.`, "warn");
     return;
   }
 
@@ -1106,13 +1157,15 @@ async function calculate() {
   const fetchController = new AbortController();
   activeFetchController = fetchController;
   scoreButton.disabled = true;
-  setStatus(`Preparing ${scanPlan.tiles.length} scan tiles for the visible area…`);
+  setStatus(scanPlan.mode === "single"
+    ? "Preparing one padded Overpass request for the visible area…"
+    : `Preparing ${scanPlan.tiles.length} fixed 5 km scan requests for the visible area…`);
 
   try {
     const scan = await scanOsmData(bbox, fetchController.signal);
     setStatus(
-      `Loaded ${scan.uniqueElementCount.toLocaleString()} unique OSM elements from ${scan.tileCount} scan tiles.\n` +
-      `${scan.fetchedTileCount} new tiles fetched; ${scan.reusedTileCount} reused from this tab.\n` +
+      `Loaded ${scan.uniqueElementCount.toLocaleString()} unique OSM elements from ${scan.tileCount} scan request${scan.tileCount === 1 ? "" : "s"}.\n` +
+      `${scan.fetchedTileCount} new request${scan.fetchedTileCount === 1 ? "" : "s"} fetched; ${scan.reusedTileCount} reused from this tab.\n` +
       `Building feature buckets and scoring in ${canUseScoringWorker() ? "a background worker" : "the main thread"}…`
     );
     const scored = await scoreOsmData(scan.osmJson, bbox, ids, fetchController.signal);
@@ -1131,8 +1184,8 @@ async function calculate() {
     setStatus(
       `Gradient complete.\nAverage score: ${avg.toFixed(1)} / 100\nRange: ${min.toFixed(1)}–${max.toFixed(1)}\n` +
       `Scoring: ${scored.usedWorker ? "background worker" : "main thread fallback"} (${Math.round(scored.elapsedMs).toLocaleString()} ms).\n` +
-      `Scan tiles: ${scan.tileCount} total, ${scan.fetchedTileCount} new, ${scan.reusedTileCount} reused from this tab.\n` +
-      `Tab cache: ${scanCache.size} scanned tiles.\n\nFeatures used:\n${summarizeFeatures(parsed.features)}`
+      `Scan requests: ${scan.tileCount} total, ${scan.fetchedTileCount} new, ${scan.reusedTileCount} reused from this tab.\n` +
+      `Tab cache: ${scanCache.size} saved scan request${scanCache.size === 1 ? "" : "s"}.\n\nFeatures used:\n${summarizeFeatures(parsed.features)}`
     );
   } catch (err) {
     if (err.name === "AbortError") return;
@@ -1157,7 +1210,7 @@ function clearMap() {
   lastGrid = [];
   lastFeatures = null;
   lastProjection = null;
-  setStatus(`Cleared the overlay. ${scanCache.size} scanned tiles are still saved in this tab.`);
+  setStatus(`Cleared the overlay. ${scanCache.size} scan request${scanCache.size === 1 ? "" : "s"} are still saved in this tab.`);
 }
 
 function nearestGridPoint(latlng) {
@@ -1207,7 +1260,7 @@ map.on("click", inspectScore);
 
 map.on("moveend", () => {
   if (lastGrid.length) {
-    setStatus(`Map moved. Click Calculate gradient again to score the new visible area. Previously scanned tiles in this tab will be reused.`, "warn");
+    setStatus("Map moved. Click Calculate gradient again to score the new visible area. Previously saved scan requests in this tab will be reused.", "warn");
   }
 });
 
