@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OSM Walkability + Bikability Gradient</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIINfQdYtGx1pErjRj+SQkNf36jHnQ+K9x4=" crossorigin="" />
+  <link rel="stylesheet" href="style.css?v=20260604-cityscan3" />
+</head>
+<body>
+  <main class="app-shell">
+    <aside class="sidebar" aria-label="Scoring controls">
+      <div class="brand">
+        <div class="brand-mark">◎</div>
+        <div>
+          <h1>OSM Access Score</h1>
+          <p>Walkability and bikability gradients from OpenStreetMap tags.</p>
+        </div>
+      </div>
+
+      <section class="card">
+        <h2>1. Pick scoring layers</h2>
+        <div class="preset-row">
+          <button id="presetWalk" type="button">Walkability</button>
+          <button id="presetBike" type="button">Bikability</button>
+          <button id="presetBoth" type="button">Both</button>
+          <button id="presetClear" type="button">Clear</button>
+        </div>
+
+        <details open>
+          <summary>Walking layers</summary>
+          <label><input type="checkbox" class="score-layer" value="walk-network" checked> Walking network</label>
+          <label><input type="checkbox" class="score-layer" value="walk-crossings" checked> Crossings</label>
+          <label><input type="checkbox" class="score-layer" value="walk-destinations" checked> Nearby destinations</label>
+          <label><input type="checkbox" class="score-layer" value="walk-transit"> Transit stops</label>
+          <label><input type="checkbox" class="score-layer" value="walk-parks"> Parks / green space</label>
+          <label><input type="checkbox" class="score-layer" value="walk-comfort" checked> Avoid high-stress roads</label>
+        </details>
+
+        <details>
+          <summary>Biking layers</summary>
+          <label><input type="checkbox" class="score-layer" value="bike-network"> Bike lanes / cycleways</label>
+          <label><input type="checkbox" class="score-layer" value="bike-low-stress"> Low-stress streets</label>
+          <label><input type="checkbox" class="score-layer" value="bike-parking"> Bike parking</label>
+          <label><input type="checkbox" class="score-layer" value="bike-calm"> Traffic calming</label>
+          <label><input type="checkbox" class="score-layer" value="bike-parks-trails"> Parks / trails</label>
+          <label><input type="checkbox" class="score-layer" value="bike-stress"> Avoid high-stress roads</label>
+        </details>
+      </section>
+
+      <section class="card">
+        <h2>2. Load the visible map area</h2>
+        <p class="small">Neighbourhood and city-sized views are split into reusable scan tiles. Already scanned tiles are kept until this tab is closed.</p>
+        <div class="button-row">
+          <button id="scoreButton" type="button" class="primary">Calculate gradient</button>
+          <button id="clearButton" type="button">Clear overlay</button>
+        </div>
+        <label class="inline-toggle"><input type="checkbox" id="showFeatures"> Show source OSM features</label>
+        <label class="inline-toggle"><input type="checkbox" id="clickInspect" checked> Click map to inspect score</label>
+      </section>
+
+      <section class="card">
+        <h2>3. Read the result</h2>
+        <div class="legend" aria-label="Score legend">
+          <span>0</span>
+          <div class="legend-bar"></div>
+          <span>100</span>
+        </div>
+        <div class="legend-labels">
+          <span>low</span><span>medium</span><span>high</span>
+        </div>
+        <div id="status" class="status">Ready. Pan or zoom to the area you want to score.</div>
+      </section>
+
+      <section class="card note">
+        <h2>Important limitations</h2>
+        <p>This is a prototype. It scores OSM tags, not official safety, accessibility, crash risk, grades, snow clearing, lighting, or real-time traffic. Missing OSM data can make places look worse than they really are.</p>
+      </section>
+    </aside>
+
+    <section class="map-panel">
+      <div id="map" aria-label="Map"></div>
+      <div class="map-help">Tip: zoom in to a neighbourhood before calculating. Click a coloured spot to see its score.</div>
+    </section>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="app.js?v=20260604-worker1"></script>
+</body>
+</html>
