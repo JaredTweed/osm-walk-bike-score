@@ -9,12 +9,13 @@ const OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter";
 const EARTH_RADIUS_M = 6371008.8;
 const DENSIFY_STEP_M = 45;
 const GRID_TARGET_POINTS = 42;
-const SCAN_TILE_SIZE_M = 5000;
+const SCAN_TILE_SIZE_M = 5000 / 3;
+const SCAN_TILE_LABEL = formatDistance(SCAN_TILE_SIZE_M);
 const SCAN_PADDING_EXTRA_M = 180;
 const MAX_SINGLE_SCAN_AREA_DEG2 = 0.08;
 const MAX_SINGLE_SCAN_LAT_SPAN_DEG = 0.30;
 const MAX_SINGLE_SCAN_LNG_SPAN_DEG = 0.50;
-const MAX_SCAN_TILES = 180;
+const MAX_SCAN_TILES = 900;
 const SCAN_TILE_DELAY_MS = 450;
 const OVERPASS_RETRY_DELAYS_MS = [1800, 4500];
 
@@ -158,6 +159,11 @@ function setSelectedLayers(ids) {
   document.querySelectorAll(".score-layer").forEach((el) => {
     el.checked = chosen.has(el.value);
   });
+}
+
+function formatDistance(meters) {
+  if (meters >= 1000) return `${(meters / 1000).toFixed(1)} km`;
+  return `${Math.round(meters)} m`;
 }
 
 function getBbox() {
@@ -333,7 +339,7 @@ function wait(ms, signal) {
 async function scanOsmData(bbox, signal) {
   const plan = scanTilesForBbox(bbox);
   if (scanPlanTooLarge(plan)) {
-    throw new Error(`This view needs ${plan.tiles.length} fixed 5 km scan requests. Zoom in until it needs ${MAX_SCAN_TILES} or fewer requests, then calculate again.`);
+    throw new Error(`This view needs ${plan.tiles.length} fixed ${SCAN_TILE_LABEL} scan requests. Zoom in until it needs ${MAX_SCAN_TILES} or fewer requests, then calculate again.`);
   }
 
   const missingTiles = plan.tiles.filter((tile) => !scanCache.has(tile.key));
@@ -341,7 +347,7 @@ async function scanOsmData(bbox, signal) {
     if (signal.aborted) throw new DOMException("Scan aborted", "AbortError");
     const tile = missingTiles[i];
     setStatus(
-      `Scanning visible area with ${plan.mode === "single" ? "one padded request" : "fixed 5 km reusable tiles"}…\n` +
+      `Scanning visible area with ${plan.mode === "single" ? "one padded request" : `fixed ${SCAN_TILE_LABEL} reusable tiles`}…\n` +
       `Request ${i + 1} of ${missingTiles.length} new; ${plan.tiles.length - missingTiles.length} reused from this tab.\n` +
       `Total scan requests for this view: ${plan.tiles.length}.`
     );
@@ -1149,7 +1155,7 @@ async function calculate() {
   const bbox = getBbox();
   const scanPlan = scanTilesForBbox(bbox);
   if (scanPlanTooLarge(scanPlan)) {
-    setStatus(`This view needs ${scanPlan.tiles.length} fixed 5 km scan requests, which is larger than the city-sized limit of ${MAX_SCAN_TILES}. Zoom in a bit and calculate again.`, "warn");
+    setStatus(`This view needs ${scanPlan.tiles.length} fixed ${SCAN_TILE_LABEL} scan requests, which is larger than the city-sized limit of ${MAX_SCAN_TILES}. Zoom in a bit and calculate again.`, "warn");
     return;
   }
 
@@ -1159,7 +1165,7 @@ async function calculate() {
   scoreButton.disabled = true;
   setStatus(scanPlan.mode === "single"
     ? "Preparing one padded Overpass request for the visible area…"
-    : `Preparing ${scanPlan.tiles.length} fixed 5 km scan requests for the visible area…`);
+    : `Preparing ${scanPlan.tiles.length} fixed ${SCAN_TILE_LABEL} scan requests for the visible area…`);
 
   try {
     const scan = await scanOsmData(bbox, fetchController.signal);
