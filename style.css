@@ -108,32 +108,9 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   gap: 8px;
 }
 
+.button-row .primary { grid-column: 1 / -1; }
+
 .inline-toggle { margin-top: 12px; }
-
-.field-label {
-  display: block;
-  margin: 13px 0 6px;
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--muted);
-}
-
-.text-input {
-  width: 100%;
-  min-height: 36px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 8px 10px;
-  color: var(--ink);
-  background: #fff;
-  font: inherit;
-  font-size: 13px;
-}
-
-.text-input:focus {
-  outline: 2px solid rgba(33, 110, 69, 0.2);
-  border-color: var(--accent);
-}
 
 .legend {
   display: grid;
@@ -219,6 +196,60 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .leaflet-popup-pane { z-index: 700; }
 
 .score-grid-layer { pointer-events: none; }
+
+.score-inspect-popup .leaflet-popup-content-wrapper {
+  overflow: hidden;
+  border: 1px solid rgba(23, 33, 27, 0.24);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 10px 28px rgba(23, 33, 27, 0.18);
+  backdrop-filter: blur(8px);
+}
+
+.score-inspect-popup .leaflet-popup-content {
+  margin: 10px 12px;
+  min-width: 230px;
+  color: #17211b;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.score-inspect-popup .leaflet-popup-tip {
+  border: 1px solid rgba(23, 33, 27, 0.2);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.score-popup strong {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+
+.score-popup table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.score-popup th,
+.score-popup td {
+  padding: 4px 5px;
+  border-top: 1px solid rgba(23, 33, 27, 0.12);
+  text-align: left;
+  vertical-align: top;
+}
+
+.score-popup th {
+  color: #4a5a50;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.score-popup td:nth-child(2),
+.score-popup th:nth-child(2) {
+  text-align: right;
+}
+
 .map-help {
   position: absolute;
   left: 18px;

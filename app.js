@@ -19,6 +19,11 @@ const MAX_SCAN_TILES = 900;
 const SCAN_TILE_DELAY_MS = 450;
 const OVERPASS_RETRY_DELAYS_MS = [1800, 4500];
 const CUSTOM_ENDPOINT_MAX_CONCURRENCY = 4;
+const CACHE_DB_NAME = "osm-access-score-cache";
+const CACHE_DB_VERSION = 1;
+const SCORE_AREAS_STORE = "scoreAreas";
+const SCAN_TILES_STORE = "scanTiles";
+const OVERLAY_VISIBLE_KEY = "osmScoreOverlayVisible";
 
 const map = L.map("map", {
   zoomControl: true,
@@ -35,8 +40,9 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
 }).addTo(map);
 
-let heatLayer = null;
+let draftLayer = null;
 let featureLayer = L.layerGroup().addTo(map);
+let scoreAreas = [];
 let lastGrid = [];
 let lastFeatures = null;
 let lastProjection = null;
@@ -47,16 +53,20 @@ let activeScoreController = null;
 let rescoreTimer = null;
 let scoringWorker = null;
 let scoringWorkerJobId = 0;
-let overpassEndpoint = localStorage.getItem("overpassEndpoint") || DEFAULT_OVERPASS_ENDPOINT;
+let scorePopup = null;
+let overpassEndpoint = DEFAULT_OVERPASS_ENDPOINT;
+let overlayVisible = localStorage.getItem(OVERLAY_VISIBLE_KEY) !== "false";
+let persistentCacheReady = Promise.resolve();
+let persistentDbPromise = null;
 const scanCache = new Map();
 const workerCachedScanKeys = new Set();
 
 const statusEl = document.getElementById("status");
 const scoreButton = document.getElementById("scoreButton");
 const clearButton = document.getElementById("clearButton");
+const toggleOverlayButton = document.getElementById("toggleOverlayButton");
 const showFeaturesEl = document.getElementById("showFeatures");
 const clickInspectEl = document.getElementById("clickInspect");
-const overpassEndpointEl = document.getElementById("overpassEndpoint");
 
 const layerDefinitions = {
   "walk-network": {
@@ -169,24 +179,6 @@ const bikePreset = ["bike-network", "bike-low-stress", "bike-parking", "bike-cal
 const MAX_SCORE_RADIUS_M = Math.max(...Object.values(layerDefinitions).map((layer) => layer.radius || 0));
 const SCAN_PADDING_M = MAX_SCORE_RADIUS_M + SCAN_PADDING_EXTRA_M;
 
-if (overpassEndpointEl) {
-  overpassEndpointEl.value = overpassEndpoint;
-  overpassEndpointEl.placeholder = DEFAULT_OVERPASS_ENDPOINT;
-  overpassEndpointEl.addEventListener("change", () => {
-    const nextEndpoint = normalizeEndpoint(overpassEndpointEl.value);
-    overpassEndpointEl.value = nextEndpoint;
-    if (nextEndpoint === overpassEndpoint) return;
-    overpassEndpoint = nextEndpoint;
-    if (overpassEndpoint === DEFAULT_OVERPASS_ENDPOINT) {
-      localStorage.removeItem("overpassEndpoint");
-    } else {
-      localStorage.setItem("overpassEndpoint", overpassEndpoint);
-    }
-    resetScanCaches();
-    setStatus(`Overpass endpoint updated. Scan cache cleared. Fetch concurrency is ${scanConcurrency()}.`);
-  });
-}
-
 function setStatus(message, level = "") {
   statusEl.textContent = message;
   statusEl.className = `status ${level}`.trim();
@@ -201,11 +193,6 @@ function setSelectedLayers(ids) {
   document.querySelectorAll(".score-layer").forEach((el) => {
     el.checked = chosen.has(el.value);
   });
-}
-
-function normalizeEndpoint(value) {
-  const trimmed = String(value || "").trim();
-  return trimmed || DEFAULT_OVERPASS_ENDPOINT;
 }
 
 function endpointHost(endpoint) {
@@ -230,12 +217,136 @@ function scanDelayMs() {
   return isPublicOverpassEndpoint() ? SCAN_TILE_DELAY_MS : 0;
 }
 
+function openPersistentDb() {
+  if (!window.indexedDB) return Promise.resolve(null);
+  if (persistentDbPromise) return persistentDbPromise;
+
+  persistentDbPromise = new Promise((resolve) => {
+    const request = indexedDB.open(CACHE_DB_NAME, CACHE_DB_VERSION);
+
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(SCORE_AREAS_STORE)) {
+        db.createObjectStore(SCORE_AREAS_STORE, { keyPath: "id" });
+      }
+      if (!db.objectStoreNames.contains(SCAN_TILES_STORE)) {
+        db.createObjectStore(SCAN_TILES_STORE, { keyPath: "key" });
+      }
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => {
+      console.warn("Persistent cache is unavailable.", request.error);
+      resolve(null);
+    };
+  });
+
+  return persistentDbPromise;
+}
+
+async function getAllFromStore(storeName) {
+  const db = await openPersistentDb();
+  if (!db) return [];
+
+  return new Promise((resolve) => {
+    const transaction = db.transaction(storeName, "readonly");
+    const request = transaction.objectStore(storeName).getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => {
+      console.warn(`Could not load ${storeName}.`, request.error);
+      resolve([]);
+    };
+  });
+}
+
+async function putInStore(storeName, value) {
+  const db = await openPersistentDb();
+  if (!db) return false;
+
+  return new Promise((resolve) => {
+    const transaction = db.transaction(storeName, "readwrite");
+    try {
+      transaction.objectStore(storeName).put(value);
+    } catch (err) {
+      console.warn(`Could not save ${storeName}.`, err);
+      resolve(false);
+      return;
+    }
+    transaction.oncomplete = () => resolve(true);
+    transaction.onerror = () => {
+      console.warn(`Could not save ${storeName}.`, transaction.error);
+      resolve(false);
+    };
+  });
+}
+
+async function clearStore(storeName) {
+  const db = await openPersistentDb();
+  if (!db) return false;
+
+  return new Promise((resolve) => {
+    const transaction = db.transaction(storeName, "readwrite");
+    try {
+      transaction.objectStore(storeName).clear();
+    } catch (err) {
+      console.warn(`Could not clear ${storeName}.`, err);
+      resolve(false);
+      return;
+    }
+    transaction.oncomplete = () => resolve(true);
+    transaction.onerror = () => {
+      console.warn(`Could not clear ${storeName}.`, transaction.error);
+      resolve(false);
+    };
+  });
+}
+
+async function hydratePersistentCaches() {
+  const [storedTiles, storedAreas] = await Promise.all([
+    getAllFromStore(SCAN_TILES_STORE),
+    getAllFromStore(SCORE_AREAS_STORE),
+  ]);
+
+  for (const tile of storedTiles) {
+    if (tile?.key && tile.osmJson) scanCache.set(tile.key, tile);
+  }
+
+  scoreAreas = storedAreas
+    .map(normalizeStoredScoreArea)
+    .filter(Boolean)
+    .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+
+  renderScoreAreas();
+  const newest = scoreAreas.at(-1);
+  if (newest) {
+    setLastArea(newest);
+    setStatus(
+      `Ready. Restored ${scoreAreas.length.toLocaleString()} saved gradient area${scoreAreas.length === 1 ? "" : "s"} and ${scanCache.size.toLocaleString()} cached scan request${scanCache.size === 1 ? "" : "s"}.`
+    );
+  }
+}
+
+function persistScanTile(entry) {
+  putInStore(SCAN_TILES_STORE, {
+    key: entry.key,
+    bbox: entry.bbox,
+    osmJson: entry.osmJson,
+    elementCount: entry.elementCount,
+    fetchedAt: entry.fetchedAt,
+  });
+}
+
+function persistScoreArea(area) {
+  putInStore(SCORE_AREAS_STORE, serializeScoreArea(area));
+}
+
 function resetScanCaches() {
   if (activeFetchController) {
     activeFetchController.abort();
     activeFetchController = null;
   }
   scanCache.clear();
+  clearStore(SCAN_TILES_STORE);
   workerCachedScanKeys.clear();
   terminateScoringWorker();
 }
@@ -442,16 +553,19 @@ async function fetchMissingScanTiles(missingTiles, plan, signal) {
       const tile = missingTiles[index];
       setStatus(
         `Scanning visible area with ${plan.mode === "single" ? "one padded request" : `fixed ${SCAN_TILE_LABEL} reusable tiles`}…\n` +
-        `Completed ${completed} of ${missingTiles.length} new request${missingTiles.length === 1 ? "" : "s"}; ${plan.tiles.length - missingTiles.length} reused from this tab.\n` +
+        `Completed ${completed} of ${missingTiles.length} new request${missingTiles.length === 1 ? "" : "s"}; ${plan.tiles.length - missingTiles.length} reused from this browser.\n` +
         `Active fetches: ${concurrency}. Total scan requests for this view: ${plan.tiles.length}.`
       );
       const osmJson = await fetchOsmData(tile.bbox, signal);
-      scanCache.set(tile.key, {
+      const cacheEntry = {
+        key: tile.key,
         bbox: tile.bbox,
         osmJson,
         elementCount: Number(osmJson.elements?.length || 0),
         fetchedAt: Date.now(),
-      });
+      };
+      scanCache.set(tile.key, cacheEntry);
+      persistScanTile(cacheEntry);
       completed++;
       if (delayMs && nextIndex < missingTiles.length) await wait(delayMs, signal);
     }
@@ -572,7 +686,7 @@ function scoreOsmData(scan, bbox, activeLayerIds, signal) {
         message.grid.meta = message.gridMeta;
         lastProjection = projection;
         lastGrid = message.grid;
-        updateHeatLayer(lastGrid);
+        showDraftGrid(lastGrid);
         setStatus(
           `Showing a fast draft gradient while final scoring continues…\n` +
           `Draft grid: ${lastGrid.length.toLocaleString()} points.`
@@ -1260,9 +1374,232 @@ function scoreCellBounds(point, meta) {
   };
 }
 
-function updateHeatLayer(grid) {
-  if (heatLayer) map.removeLayer(heatLayer);
-  heatLayer = new ScoreGridLayer(grid).addTo(map);
+function makeAreaId() {
+  return `area:${Date.now()}:${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function projectionCenterForBbox(bbox) {
+  return (bbox.north + bbox.south) / 2;
+}
+
+function cloneBbox(bbox) {
+  return {
+    south: bbox.south,
+    west: bbox.west,
+    north: bbox.north,
+    east: bbox.east,
+  };
+}
+
+function compactComponents(components = []) {
+  return components.map((component) => ({
+    label: component.label,
+    score: Number(component.score || 0),
+    distance: Number.isFinite(component.distance) ? component.distance : null,
+    type: component.type,
+    featureCount: component.featureCount,
+    categoryCount: component.categoryCount,
+    matchCount: component.matchCount,
+  }));
+}
+
+function serializeGrid(grid) {
+  return grid.map((point) => ({
+    lat: point.lat,
+    lng: point.lng,
+    xIndex: point.xIndex,
+    yIndex: point.yIndex,
+    score: point.score,
+    components: compactComponents(point.components),
+  }));
+}
+
+function normalizeGrid(grid, gridMeta, projectionCenterLat) {
+  if (!Array.isArray(grid) || !gridMeta?.bbox) return null;
+  const projection = makeProjection(projectionCenterLat);
+  const normalized = grid.map((point) => ({
+    lat: point.lat,
+    lng: point.lng,
+    xIndex: point.xIndex,
+    yIndex: point.yIndex,
+    score: point.score,
+    components: (point.components || []).map((component) => ({
+      ...component,
+      distance: component.distance === null ? Infinity : component.distance,
+    })),
+    ...projection.toXY(point.lat, point.lng),
+  }));
+  normalized.meta = {
+    bbox: cloneBbox(gridMeta.bbox),
+    lngCount: gridMeta.lngCount,
+    latCount: gridMeta.latCount,
+  };
+  return normalized;
+}
+
+function normalizeStoredScoreArea(stored) {
+  if (!stored?.grid?.length) return null;
+  const gridMeta = stored.gridMeta || stored.grid.meta;
+  if (!gridMeta?.bbox) return null;
+  const projectionCenterLat = stored.projectionCenterLat || projectionCenterForBbox(gridMeta.bbox);
+  const grid = normalizeGrid(stored.grid, gridMeta, projectionCenterLat);
+  if (!grid) return null;
+  return {
+    id: stored.id || makeAreaId(),
+    createdAt: stored.createdAt || Date.now(),
+    bbox: cloneBbox(stored.bbox || gridMeta.bbox),
+    grid,
+    gridMeta: grid.meta,
+    projectionCenterLat,
+    layerIds: stored.layerIds || [],
+    scanTileKeys: stored.scanTileKeys || [],
+    stats: stored.stats || gridStats(grid),
+    layer: null,
+  };
+}
+
+function serializeScoreArea(area) {
+  return {
+    id: area.id,
+    createdAt: area.createdAt,
+    bbox: cloneBbox(area.bbox),
+    grid: serializeGrid(area.grid),
+    gridMeta: area.grid.meta,
+    projectionCenterLat: area.projectionCenterLat,
+    layerIds: area.layerIds || [],
+    scanTileKeys: area.scanTileKeys || [],
+    stats: area.stats || gridStats(area.grid),
+  };
+}
+
+function scanFromArea(area) {
+  const keys = area.scanTileKeys || [];
+  if (!keys.length) return null;
+
+  const requests = [];
+  const elementsByKey = new Map();
+  let rawElementCount = 0;
+  for (const key of keys) {
+    const cached = scanCache.get(key);
+    if (!cached?.osmJson) return null;
+    requests.push({
+      key: cached.key,
+      bbox: cached.bbox,
+      osmJson: cached.osmJson,
+      elementCount: cached.elementCount,
+    });
+    for (const el of cached.osmJson.elements || []) {
+      rawElementCount++;
+      elementsByKey.set(`${el.type}/${el.id}`, el);
+    }
+  }
+
+  return {
+    osmJson: { elements: [...elementsByKey.values()] },
+    requests,
+    tileCount: requests.length,
+    mode: requests.length === 1 ? "single" : "tiled",
+    fetchedTileCount: 0,
+    reusedTileCount: requests.length,
+    rawElementCount,
+    uniqueElementCount: elementsByKey.size,
+  };
+}
+
+function createScoreArea(scored, scan, bbox, layerIds) {
+  const grid = scored.grid;
+  const gridMeta = grid.meta || { bbox, lngCount: GRID_TARGET_POINTS, latCount: GRID_TARGET_POINTS };
+  return {
+    id: makeAreaId(),
+    createdAt: Date.now(),
+    bbox: cloneBbox(gridMeta.bbox || bbox),
+    grid,
+    gridMeta,
+    projectionCenterLat: projectionCenterForBbox(gridMeta.bbox || bbox),
+    layerIds: [...layerIds],
+    scanTileKeys: (scan?.requests || []).map((request) => request.key),
+    stats: gridStats(grid),
+    layer: null,
+  };
+}
+
+function setLastArea(area, scan = null) {
+  lastGrid = area.grid;
+  lastProjection = makeProjection(area.projectionCenterLat);
+  lastBbox = area.bbox;
+  lastScan = scan || scanFromArea(area);
+}
+
+function addAreaLayer(area) {
+  if (!overlayVisible || area.layer) return;
+  area.layer = new ScoreGridLayer(area.grid).addTo(map);
+}
+
+function removeAreaLayer(area) {
+  if (!area.layer) return;
+  map.removeLayer(area.layer);
+  area.layer = null;
+}
+
+function clearDraftLayer() {
+  if (!draftLayer) return;
+  map.removeLayer(draftLayer);
+  draftLayer = null;
+}
+
+function showDraftGrid(grid) {
+  clearDraftLayer();
+  if (overlayVisible) draftLayer = new ScoreGridLayer(grid).addTo(map);
+}
+
+function renderScoreAreas() {
+  clearDraftLayer();
+  for (const area of scoreAreas) {
+    if (overlayVisible) addAreaLayer(area);
+    else removeAreaLayer(area);
+  }
+  updateOverlayButton();
+}
+
+function updateOverlayButton() {
+  if (!toggleOverlayButton) return;
+  toggleOverlayButton.textContent = overlayVisible ? "Hide overlay" : "Show overlay";
+  toggleOverlayButton.setAttribute("aria-pressed", String(!overlayVisible));
+}
+
+function setOverlayVisible(visible) {
+  overlayVisible = visible;
+  localStorage.setItem(OVERLAY_VISIBLE_KEY, String(overlayVisible));
+  renderScoreAreas();
+  closeScorePopup();
+  setStatus(
+    overlayVisible
+      ? `Overlay shown. ${scoreAreas.length.toLocaleString()} saved gradient area${scoreAreas.length === 1 ? "" : "s"} visible.`
+      : `Overlay hidden. ${scoreAreas.length.toLocaleString()} saved gradient area${scoreAreas.length === 1 ? "" : "s"} kept.`
+  );
+}
+
+function addScoreArea(area) {
+  scoreAreas.push(area);
+  addAreaLayer(area);
+  setLastArea(area);
+  persistScoreArea(area);
+  return area;
+}
+
+function updateScoreArea(area, scored, scan, layerIds) {
+  removeAreaLayer(area);
+  area.grid = scored.grid;
+  area.gridMeta = scored.grid.meta;
+  area.bbox = cloneBbox(scored.grid.meta.bbox);
+  area.projectionCenterLat = projectionCenterForBbox(area.bbox);
+  area.layerIds = [...layerIds];
+  area.scanTileKeys = (scan?.requests || area.scanTileKeys || []).map((request) => request.key || request);
+  area.stats = gridStats(area.grid);
+  addAreaLayer(area);
+  setLastArea(area, scan);
+  persistScoreArea(area);
+  return area;
 }
 
 function renderFeatureLayer(parsed) {
@@ -1330,11 +1667,12 @@ function summarizeFeatures(features) {
 }
 
 function clearGradientOverlay() {
-  if (heatLayer) {
-    map.removeLayer(heatLayer);
-    heatLayer = null;
-  }
+  closeScorePopup();
+  clearDraftLayer();
+  for (const area of scoreAreas) removeAreaLayer(area);
+  scoreAreas = [];
   lastGrid = [];
+  clearStore(SCORE_AREAS_STORE);
 }
 
 function gridStats(grid) {
@@ -1347,26 +1685,29 @@ function gridStats(grid) {
   };
 }
 
-function applyScoredResult(scored, scan, heading) {
+function applyScoredResult(scored, scan, heading, options = {}) {
   const parsed = scored.parsed;
   lastFeatures = parsed;
   lastProjection = parsed.projection;
   renderFeatureLayer(parsed);
 
   setStatus("Drawing the gradient overlay...");
-  lastGrid = scored.grid;
-  updateHeatLayer(lastGrid);
+  clearDraftLayer();
+  const area = options.area
+    ? updateScoreArea(options.area, scored, scan || scanFromArea(options.area), options.layerIds || options.area.layerIds || [])
+    : addScoreArea(createScoreArea(scored, scan, options.bbox || scored.grid.meta.bbox, options.layerIds || selectedLayerIds()));
 
-  const stats = gridStats(lastGrid);
+  const stats = area.stats;
   const scanRequestLine = scan
-    ? `Scan requests: ${scan.tileCount} total, ${scan.fetchedTileCount} new, ${scan.reusedTileCount} reused from this tab.\n`
+    ? `Scan requests: ${scan.tileCount} total, ${scan.fetchedTileCount} new, ${scan.reusedTileCount} reused from this browser.\n`
     : "";
   setStatus(
     `${heading}\nAverage score: ${stats.avg.toFixed(1)} / 100\nRange: ${stats.min.toFixed(1)}-${stats.max.toFixed(1)}\n` +
     `Scoring: ${scored.usedWorker ? "background worker" : "main thread fallback"} (${Math.round(scored.elapsedMs).toLocaleString()} ms).\n` +
     (scored.cache ? `Parsed cache: ${scored.cache.tileHits} reused, ${scored.cache.tileMisses} parsed.\n` : "") +
     scanRequestLine +
-    `Tab cache: ${scanCache.size} saved scan request${scanCache.size === 1 ? "" : "s"}.\n\nFeatures used:\n${summarizeFeatures(parsed.features)}`
+    `Saved gradients: ${scoreAreas.length.toLocaleString()} area${scoreAreas.length === 1 ? "" : "s"}.\n` +
+    `Browser cache: ${scanCache.size} saved scan request${scanCache.size === 1 ? "" : "s"}.\n\nFeatures used:\n${summarizeFeatures(parsed.features)}`
   );
 }
 
@@ -1378,6 +1719,7 @@ function scheduleRescoreFromLastScan(reason = "Layer selection changed.") {
 }
 
 async function rescoreFromLastScan(reason = "Layer selection changed.") {
+  await persistentCacheReady;
   const ids = selectedLayerIds();
 
   if (!ids.length) {
@@ -1385,12 +1727,13 @@ async function rescoreFromLastScan(reason = "Layer selection changed.") {
       activeScoreController.abort();
       activeScoreController = null;
     }
-    clearGradientOverlay();
+    clearDraftLayer();
     setStatus("Select at least one scoring layer to draw a gradient.", "warn");
     return;
   }
 
-  if (!lastScan || !lastBbox) {
+  const areasToRescore = scoreAreas.filter((area) => scanFromArea(area));
+  if (!areasToRescore.length && (!lastScan || !lastBbox)) {
     return;
   }
 
@@ -1403,11 +1746,36 @@ async function rescoreFromLastScan(reason = "Layer selection changed.") {
   const scoreController = new AbortController();
   activeScoreController = scoreController;
   scoreButton.disabled = true;
-  setStatus(`${reason}\nRe-scoring the saved scan without another Overpass request...`);
+  setStatus(`${reason}\nRe-scoring saved gradient area${areasToRescore.length === 1 ? "" : "s"} without another Overpass request...`);
 
   try {
-    const scored = await scoreOsmData(lastScan, lastBbox, ids, scoreController.signal);
-    applyScoredResult(scored, null, "Gradient updated from the saved scan.");
+    if (areasToRescore.length) {
+      let latestScored = null;
+      let latestScan = null;
+      let latestArea = null;
+      for (const [index, area] of areasToRescore.entries()) {
+        if (scoreController.signal.aborted) throw new DOMException("Scoring aborted", "AbortError");
+        const scan = scanFromArea(area);
+        setStatus(
+          `${reason}\nRe-scoring saved gradient ${index + 1} of ${areasToRescore.length} without another Overpass request...`
+        );
+        const scored = await scoreOsmData(scan, area.bbox, ids, scoreController.signal);
+        clearDraftLayer();
+        updateScoreArea(area, scored, scan, ids);
+        latestScored = scored;
+        latestScan = scan;
+        latestArea = area;
+      }
+      if (latestScored && latestArea) {
+        lastFeatures = latestScored.parsed;
+        lastProjection = latestScored.parsed.projection;
+        renderFeatureLayer(latestScored.parsed);
+        applyScoredResult(latestScored, latestScan, "Saved gradients updated.", { area: latestArea, layerIds: ids });
+      }
+    } else {
+      const scored = await scoreOsmData(lastScan, lastBbox, ids, scoreController.signal);
+      applyScoredResult(scored, lastScan, "Gradient updated from the saved scan.", { bbox: lastBbox, layerIds: ids });
+    }
   } catch (err) {
     if (err.name !== "AbortError") {
       setStatus(err.message || "Something went wrong while re-scoring.", "error");
@@ -1419,6 +1787,7 @@ async function rescoreFromLastScan(reason = "Layer selection changed.") {
 }
 
 async function calculate() {
+  await persistentCacheReady;
   const ids = selectedLayerIds();
   if (!ids.length) {
     setStatus("Select at least one scoring layer first.", "warn");
@@ -1452,7 +1821,7 @@ async function calculate() {
       : `${scan.uniqueElementCount.toLocaleString()} unique OSM elements`;
     setStatus(
       `Loaded ${elementSummary} from ${scan.tileCount} scan request${scan.tileCount === 1 ? "" : "s"}.\n` +
-      `${scan.fetchedTileCount} new request${scan.fetchedTileCount === 1 ? "" : "s"} fetched; ${scan.reusedTileCount} reused from this tab.\n` +
+      `${scan.fetchedTileCount} new request${scan.fetchedTileCount === 1 ? "" : "s"} fetched; ${scan.reusedTileCount} reused from this browser.\n` +
       `Building feature buckets and scoring in ${canUseScoringWorker() ? "a background worker" : "the main thread"}…`
     );
     lastScan = scan;
@@ -1460,13 +1829,13 @@ async function calculate() {
 
     const scoreIds = selectedLayerIds();
     if (!scoreIds.length) {
-      clearGradientOverlay();
-      setStatus("Scan loaded and saved in this tab. Select at least one scoring layer to draw a gradient.", "warn");
+      clearDraftLayer();
+      setStatus("Scan loaded and saved in this browser. Select at least one scoring layer to draw a gradient.", "warn");
       return;
     }
 
     const scored = await scoreOsmData(scan, bbox, scoreIds, fetchController.signal);
-    applyScoredResult(scored, scan, "Gradient complete.");
+    applyScoredResult(scored, scan, "Gradient complete.", { bbox, layerIds: scoreIds });
   } catch (err) {
     if (err.name === "AbortError") return;
     setStatus(err.message || "Something went wrong while calculating.", "error");
@@ -1495,24 +1864,44 @@ function clearMap() {
   lastProjection = null;
   lastScan = null;
   lastBbox = null;
-  setStatus(`Cleared the overlay. ${scanCache.size} scan request${scanCache.size === 1 ? "" : "s"} are still saved in this tab.`);
+  setStatus(`Cleared saved gradient overlays. ${scanCache.size} scan request${scanCache.size === 1 ? "" : "s"} remain cached in this browser.`);
 }
 
 function nearestGridPoint(latlng) {
-  if (!lastGrid.length) return null;
-  const projection = lastProjection || makeProjection(map.getCenter().lat);
-  const p = { lat: latlng.lat, lng: latlng.lng, ...projection.toXY(latlng.lat, latlng.lng) };
+  if (!overlayVisible || !scoreAreas.length) return null;
   let best = null;
   let bestDist = Infinity;
-  for (const g of lastGrid) {
-    const d = metersBetween(p, g);
-    if (d < bestDist) { bestDist = d; best = g; }
+  for (const area of scoreAreas) {
+    if (!bboxContainsLatLng(area.bbox, latlng)) continue;
+    const projection = makeProjection(area.projectionCenterLat);
+    const p = { lat: latlng.lat, lng: latlng.lng, ...projection.toXY(latlng.lat, latlng.lng) };
+    for (const g of area.grid) {
+      const d = metersBetween(p, g);
+      if (d < bestDist) {
+        bestDist = d;
+        best = { point: g, area };
+      }
+    }
   }
-  return best ? { point: best, distance: bestDist } : null;
+  return best ? { ...best, distance: bestDist } : null;
+}
+
+function bboxContainsLatLng(bbox, latlng) {
+  if (!bbox) return false;
+  return latlng.lat >= bbox.south &&
+    latlng.lat <= bbox.north &&
+    latlng.lng >= bbox.west &&
+    latlng.lng <= bbox.east;
+}
+
+function closeScorePopup() {
+  if (!scorePopup) return;
+  map.closePopup(scorePopup);
+  scorePopup = null;
 }
 
 function inspectScore(e) {
-  if (!clickInspectEl.checked || !lastGrid.length) return;
+  if (!clickInspectEl.checked || !scoreAreas.length || !overlayVisible) return;
   const found = nearestGridPoint(e.latlng);
   if (!found) return;
   const { point } = found;
@@ -1528,8 +1917,9 @@ function inspectScore(e) {
     })
     .join("");
 
-  L.popup()
-    .setLatLng(e.latlng)
+  closeScorePopup();
+  const popup = L.popup({ className: "score-inspect-popup", autoPan: false })
+    .setLatLng([point.lat, point.lng])
     .setContent(`
       <div class="score-popup">
         <strong>Score: ${point.score.toFixed(1)} / 100</strong>
@@ -1540,16 +1930,22 @@ function inspectScore(e) {
       </div>
     `)
     .openOn(map);
+  scorePopup = popup;
+  popup.on("remove", () => {
+    if (scorePopup === popup) scorePopup = null;
+  });
 }
 
 scoreButton.addEventListener("click", calculate);
 clearButton.addEventListener("click", clearMap);
+toggleOverlayButton?.addEventListener("click", () => setOverlayVisible(!overlayVisible));
 showFeaturesEl.addEventListener("change", () => renderFeatureLayer(lastFeatures));
 map.on("click", inspectScore);
+map.on("dragstart", closeScorePopup);
 
 map.on("moveend", () => {
-  if (lastGrid.length) {
-    setStatus("Map moved. Click Calculate gradient again to score the new visible area. Previously saved scan requests in this tab will be reused.", "warn");
+  if (scoreAreas.length) {
+    setStatus("Map moved. Click Calculate gradient again to add this visible area. Saved gradients and scan requests will be reused when possible.", "warn");
   }
 });
 
@@ -1572,4 +1968,9 @@ document.getElementById("presetBoth").addEventListener("click", () => {
 document.getElementById("presetClear").addEventListener("click", () => {
   setSelectedLayers([]);
   scheduleRescoreFromLastScan("Layer selection cleared.");
+});
+
+updateOverlayButton();
+persistentCacheReady = hydratePersistentCaches().catch((err) => {
+  console.warn("Persistent cache restore failed.", err);
 });

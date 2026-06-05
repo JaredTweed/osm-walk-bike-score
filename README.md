@@ -21,12 +21,13 @@ http://localhost:8000
 1. Uses Leaflet for the map.
 2. Uses OpenStreetMap raster tiles for the base map.
 3. Fetches one padded Overpass scan for the visible map area when it fits public-service limits.
-4. Uses fixed 1.7 km scan tiles only for larger areas, and keeps scan results in memory while the tab is open.
+4. Uses fixed 1.7 km scan tiles only for larger areas, and keeps scan results in the browser cache.
 5. Converts selected walking/biking layers into cached feature buckets.
-6. Re-scores the last loaded scan automatically when layer checkboxes change, without another Overpass request.
-7. Parses features and scores a physically even grid of map points from 0 to 100, using a Web Worker when served over HTTP.
-8. Renders a coarse draft gradient first, then replaces it with the full-resolution result.
-9. Supports a configurable Overpass-compatible endpoint, so a local/private backend can run limited parallel fetches.
+6. Keeps completed gradient areas visible together instead of replacing older calculations.
+7. Saves completed gradients and scan tiles in IndexedDB so they can restore after restarting the browser.
+8. Re-scores saved scans automatically when layer checkboxes change, without another Overpass request when the cached scan tiles are available.
+9. Parses features and scores a physically even grid of map points from 0 to 100, using a Web Worker when served over HTTP.
+10. Renders a coarse draft gradient first, then replaces it with the full-resolution result.
 
 ## Current scoring layers
 
@@ -67,13 +68,13 @@ This is not an official accessibility, safety, or transportation model. It does 
 - missing or incorrectly tagged OSM data
 - very large scans beyond a city-sized view; those are still blocked to avoid overloading public Overpass service
 - faster CPU scoring requires serving the app over HTTP; direct `file://` loading falls back to main-thread scoring because browsers often block local Web Workers
-- public Overpass requests remain serial by design; parallel fetching is enabled only for custom/private endpoints to avoid rate-limit slowdowns
+- public Overpass requests remain serial by design to avoid rate-limit slowdowns
 
 For production use, consider:
 
 - hosting your own tiles or using a commercial tile provider
 - caching Overpass responses or importing OSM data into PostGIS
-- pointing the endpoint field at a local Overpass instance or an Overpass-compatible proxy backed by imported OSM data
+- replacing the built-in public Overpass endpoint with a local Overpass instance or an Overpass-compatible proxy backed by imported OSM data
 - replacing the simple distance model with a routable network model
 - calibrating weights against local policy goals or survey data
 - adding official municipal open data for sidewalks, traffic volumes, collisions, speed limits, cycling facilities, and transit frequency
