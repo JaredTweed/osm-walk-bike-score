@@ -23,9 +23,10 @@ http://localhost:8000
 3. Fetches one padded Overpass scan for the visible map area when it fits public-service limits.
 4. Uses fixed 1.7 km scan tiles only for larger areas, and keeps scan results in memory while the tab is open.
 5. Converts selected walking/biking layers into cached feature buckets.
-6. Parses features and scores a physically even grid of map points from 0 to 100, using a Web Worker when served over HTTP.
-7. Renders a coarse draft gradient first, then replaces it with the full-resolution result.
-8. Supports a configurable Overpass-compatible endpoint, so a local/private backend can run limited parallel fetches.
+6. Re-scores the last loaded scan automatically when layer checkboxes change, without another Overpass request.
+7. Parses features and scores a physically even grid of map points from 0 to 100, using a Web Worker when served over HTTP.
+8. Renders a coarse draft gradient first, then replaces it with the full-resolution result.
+9. Supports a configurable Overpass-compatible endpoint, so a local/private backend can run limited parallel fetches.
 
 ## Current scoring layers
 
@@ -33,7 +34,9 @@ Walking:
 
 - walking network: sidewalks, footways, paths, pedestrian ways, walkable streets
 - crossings
-- nearby destinations: proximity plus diversity across groceries, food, healthcare, education, civic, retail, culture, and related categories
+- groceries: high-priority walking access to supermarkets, convenience stores, bakeries, butchers, greengrocers, and related food shops
+- daily destinations: proximity plus diversity across groceries, food, healthcare, education, civic, retail, fitness, culture, and related categories
+- gyms / fitness: optional access layer for fitness centres, gyms, sports centres, and fitness stations
 - transit stops
 - parks / green space
 - avoiding high-stress roads

@@ -284,7 +284,10 @@ function destinationCategory(tags) {
 
   const shop = tagValue(tags, "shop");
   if (shop && !["no", "vacant", "closed", "disused"].includes(shop)) {
-    if (["supermarket", "convenience", "greengrocer", "bakery", "butcher", "deli", "seafood", "cheese", "alcohol", "beverages"].includes(shop)) return "groceries";
+    if ([
+      "supermarket", "convenience", "greengrocer", "bakery", "butcher", "deli", "seafood", "cheese",
+      "dairy", "frozen_food", "health_food", "farm", "confectionery", "alcohol", "beverages"
+    ].includes(shop)) return "groceries";
     if (["chemist", "medical_supply", "optician", "hearing_aids"].includes(shop)) return "health";
     if (["department_store", "mall", "clothes", "shoes", "hardware", "doityourself", "books", "stationery"].includes(shop)) return "retail";
     return "shops";
@@ -298,6 +301,8 @@ function destinationCategory(tags) {
     bar: "food",
     ice_cream: "food",
     food_court: "food",
+    gym: "fitness",
+    fitness_centre: "fitness",
     library: "civic",
     school: "education",
     university: "education",
@@ -325,6 +330,13 @@ function destinationCategory(tags) {
     police: "civic",
   };
   if (amenityCategories[tags.amenity]) return amenityCategories[tags.amenity];
+
+  const leisureCategories = {
+    fitness_centre: "fitness",
+    fitness_station: "fitness",
+    sports_centre: "fitness",
+  };
+  if (leisureCategories[tags.leisure]) return leisureCategories[tags.leisure];
 
   const tourismCategories = {
     attraction: "culture",
@@ -463,6 +475,10 @@ function combineGroups(features, groups) {
   return groups.flatMap((group) => features[group] || []);
 }
 
+function matchesLayerCategories(candidate, categories) {
+  return !categories?.length || categories.includes(candidate.category);
+}
+
 function buildSpatialIndex(candidates, radiusM) {
   const cellSizeM = clamp(radiusM / 2, 80, 260);
   const buckets = new Map();
@@ -532,7 +548,37 @@ function avoidScore(distanceM, radiusM) {
   return 100 - proximityScore(distanceM, radiusM);
 }
 
-function destinationScore(point, source, radiusM) {
+function categoryAccessScore(point, source, radiusM) {
+  if (!source.candidates.length) {
+    return { score: 0, distance: Infinity, matchCount: 0 };
+  }
+
+  const nearby = candidatesWithin(point, source, radiusM);
+  if (!nearby.length) {
+    return { score: 0, distance: Infinity, matchCount: 0 };
+  }
+
+  const nearest = nearestDistanceM(point, nearby);
+  const scores = nearby
+    .map((candidate) => proximityScore(metersBetween(point, candidate), radiusM))
+    .filter((score) => score > 0)
+    .sort((a, b) => b - a);
+
+  return {
+    score: clamp(
+      (scores[0] || 0) +
+      ((scores[1] || 0) * 0.18) +
+      ((scores[2] || 0) * 0.08) +
+      ((scores[3] || 0) * 0.04),
+      0,
+      100
+    ),
+    distance: nearest,
+    matchCount: scores.length,
+  };
+}
+
+function destinationPortfolioScore(point, source, radiusM) {
   if (!source.candidates.length) {
     return { score: 0, distance: Infinity, categoryCount: 0 };
   }
@@ -544,15 +590,16 @@ function destinationScore(point, source, radiusM) {
 
   const nearest = nearestDistanceM(point, nearby);
   const categoryWeights = {
-    groceries: 1.25,
-    food: 0.9,
-    health: 0.9,
+    groceries: 1.8,
+    health: 1.0,
+    food: 0.85,
     education: 0.75,
-    civic: 0.7,
-    shops: 0.65,
-    retail: 0.55,
-    finance: 0.45,
-    culture: 0.45,
+    civic: 0.65,
+    shops: 0.6,
+    retail: 0.5,
+    fitness: 0.5,
+    finance: 0.4,
+    culture: 0.4,
     recreation: 0.35,
     community: 0.35,
   };
@@ -571,7 +618,7 @@ function destinationScore(point, source, radiusM) {
   }
 
   return {
-    score: clamp(weightedCategoryScore / 4.1, 0, 100),
+    score: clamp(weightedCategoryScore / 5.25, 0, 100),
     distance: nearest,
     categoryCount: categoryScores.size,
   };
@@ -599,7 +646,8 @@ function walkNetworkScore(point, layer) {
 }
 
 function layerScore(point, layer) {
-  if (layer.type === "destination") return destinationScore(point, layer.source, layer.radius);
+  if (layer.type === "categoryAccess") return categoryAccessScore(point, layer.source, layer.radius);
+  if (layer.type === "destinationPortfolio") return destinationPortfolioScore(point, layer.source, layer.radius);
   if (layer.type === "walkNetwork") return walkNetworkScore(point, layer);
   return nearLayerScore(point, layer);
 }
@@ -631,10 +679,12 @@ function scoreGrid(features, projection, bbox, activeLayerIds, targetPoints = GR
     .map((id) => {
       const definition = layerDefinitions[id];
       if (!definition) return null;
+      const candidates = combineGroups(features, definition.groups)
+        .filter((candidate) => matchesLayerCategories(candidate, definition.categories));
       return {
         id,
         ...definition,
-        candidates: combineGroups(features, definition.groups),
+        candidates,
         fallbackCandidates: combineGroups(features, definition.fallbackGroups || []),
       };
     })
@@ -682,6 +732,7 @@ function scoreGrid(features, projection, bbox, activeLayerIds, targetPoints = GR
         type: layer.type,
         featureCount: layer.candidates.length,
         categoryCount: result.categoryCount,
+        matchCount: result.matchCount,
       });
     }
 

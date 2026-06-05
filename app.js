@@ -40,7 +40,11 @@ let featureLayer = L.layerGroup().addTo(map);
 let lastGrid = [];
 let lastFeatures = null;
 let lastProjection = null;
+let lastScan = null;
+let lastBbox = null;
 let activeFetchController = null;
+let activeScoreController = null;
+let rescoreTimer = null;
 let scoringWorker = null;
 let scoringWorkerJobId = 0;
 let overpassEndpoint = localStorage.getItem("overpassEndpoint") || DEFAULT_OVERPASS_ENDPOINT;
@@ -71,12 +75,28 @@ const layerDefinitions = {
     radius: 140,
     weight: 0.75,
   },
-  "walk-destinations": {
-    label: "Nearby destinations",
-    type: "destination",
+  "walk-groceries": {
+    label: "Groceries",
+    type: "categoryAccess",
     groups: ["destinations"],
-    radius: 430,
-    weight: 1.6,
+    categories: ["groceries"],
+    radius: 950,
+    weight: 1.35,
+  },
+  "walk-destinations": {
+    label: "Daily destinations",
+    type: "destinationPortfolio",
+    groups: ["destinations"],
+    radius: 850,
+    weight: 1.1,
+  },
+  "walk-fitness": {
+    label: "Gyms / fitness",
+    type: "categoryAccess",
+    groups: ["destinations"],
+    categories: ["fitness"],
+    radius: 1000,
+    weight: 0.45,
   },
   "walk-transit": {
     label: "Transit stops",
@@ -144,7 +164,7 @@ const layerDefinitions = {
   },
 };
 
-const walkPreset = ["walk-network", "walk-crossings", "walk-destinations", "walk-comfort"];
+const walkPreset = ["walk-network", "walk-crossings", "walk-groceries", "walk-destinations", "walk-comfort"];
 const bikePreset = ["bike-network", "bike-low-stress", "bike-parking", "bike-calm", "bike-parks-trails", "bike-stress"];
 const MAX_SCORE_RADIUS_M = Math.max(...Object.values(layerDefinitions).map((layer) => layer.radius || 0));
 const SCAN_PADDING_M = MAX_SCORE_RADIUS_M + SCAN_PADDING_EXTRA_M;
@@ -338,7 +358,7 @@ function buildOverpassQuery(bbox) {
   way["amenity"](${box});
   way["shop"](${box});
   way["tourism"~"^(attraction|museum|gallery|viewpoint)$"](${box});
-  way["leisure"~"^(park|playground|garden|nature_reserve)$"](${box});
+  way["leisure"~"^(park|playground|garden|nature_reserve|fitness_centre|fitness_station|sports_centre)$"](${box});
   way["landuse"~"^(grass|recreation_ground|village_green)$"](${box});
   way["traffic_calming"](${box});
   node["highway"="crossing"](${box});
@@ -346,7 +366,7 @@ function buildOverpassQuery(bbox) {
   node["amenity"](${box});
   node["shop"](${box});
   node["tourism"~"^(attraction|museum|gallery|viewpoint)$"](${box});
-  node["leisure"~"^(park|playground|garden|nature_reserve)$"](${box});
+  node["leisure"~"^(park|playground|garden|nature_reserve|fitness_centre|fitness_station|sports_centre)$"](${box});
   node["public_transport"](${box});
   node["highway"="bus_stop"](${box});
   node["railway"~"^(station|halt|tram_stop|subway_entrance)$"](${box});
@@ -479,7 +499,7 @@ function canUseScoringWorker() {
 
 function getScoringWorker() {
   if (!scoringWorker) {
-    scoringWorker = new Worker("scoring-worker.js?v=20260605-fast1");
+    scoringWorker = new Worker("scoring-worker.js?v=20260605-scoremodel1");
   }
   return scoringWorker;
 }
@@ -691,7 +711,10 @@ function destinationCategory(tags) {
 
   const shop = tagValue(tags, "shop");
   if (shop && !["no", "vacant", "closed", "disused"].includes(shop)) {
-    if (["supermarket", "convenience", "greengrocer", "bakery", "butcher", "deli", "seafood", "cheese", "alcohol", "beverages"].includes(shop)) return "groceries";
+    if ([
+      "supermarket", "convenience", "greengrocer", "bakery", "butcher", "deli", "seafood", "cheese",
+      "dairy", "frozen_food", "health_food", "farm", "confectionery", "alcohol", "beverages"
+    ].includes(shop)) return "groceries";
     if (["chemist", "medical_supply", "optician", "hearing_aids"].includes(shop)) return "health";
     if (["department_store", "mall", "clothes", "shoes", "hardware", "doityourself", "books", "stationery"].includes(shop)) return "retail";
     return "shops";
@@ -705,6 +728,8 @@ function destinationCategory(tags) {
     bar: "food",
     ice_cream: "food",
     food_court: "food",
+    gym: "fitness",
+    fitness_centre: "fitness",
     library: "civic",
     school: "education",
     university: "education",
@@ -732,6 +757,13 @@ function destinationCategory(tags) {
     police: "civic",
   };
   if (amenityCategories[tags.amenity]) return amenityCategories[tags.amenity];
+
+  const leisureCategories = {
+    fitness_centre: "fitness",
+    fitness_station: "fitness",
+    sports_centre: "fitness",
+  };
+  if (leisureCategories[tags.leisure]) return leisureCategories[tags.leisure];
 
   const tourismCategories = {
     attraction: "culture",
@@ -869,6 +901,10 @@ function combineGroups(features, groups) {
   return groups.flatMap((group) => features[group] || []);
 }
 
+function matchesLayerCategories(candidate, categories) {
+  return !categories?.length || categories.includes(candidate.category);
+}
+
 function buildSpatialIndex(candidates, radiusM) {
   const cellSizeM = clamp(radiusM / 2, 80, 260);
   const buckets = new Map();
@@ -938,7 +974,37 @@ function avoidScore(distanceM, radiusM) {
   return 100 - proximityScore(distanceM, radiusM);
 }
 
-function destinationScore(point, source, radiusM) {
+function categoryAccessScore(point, source, radiusM) {
+  if (!source.candidates.length) {
+    return { score: 0, distance: Infinity, matchCount: 0 };
+  }
+
+  const nearby = candidatesWithin(point, source, radiusM);
+  if (!nearby.length) {
+    return { score: 0, distance: Infinity, matchCount: 0 };
+  }
+
+  const nearest = nearestDistanceM(point, nearby);
+  const scores = nearby
+    .map((candidate) => proximityScore(metersBetween(point, candidate), radiusM))
+    .filter((score) => score > 0)
+    .sort((a, b) => b - a);
+
+  return {
+    score: clamp(
+      (scores[0] || 0) +
+      ((scores[1] || 0) * 0.18) +
+      ((scores[2] || 0) * 0.08) +
+      ((scores[3] || 0) * 0.04),
+      0,
+      100
+    ),
+    distance: nearest,
+    matchCount: scores.length,
+  };
+}
+
+function destinationPortfolioScore(point, source, radiusM) {
   if (!source.candidates.length) {
     return { score: 0, distance: Infinity, categoryCount: 0 };
   }
@@ -950,15 +1016,16 @@ function destinationScore(point, source, radiusM) {
 
   const nearest = nearestDistanceM(point, nearby);
   const categoryWeights = {
-    groceries: 1.25,
-    food: 0.9,
-    health: 0.9,
+    groceries: 1.8,
+    health: 1.0,
+    food: 0.85,
     education: 0.75,
-    civic: 0.7,
-    shops: 0.65,
-    retail: 0.55,
-    finance: 0.45,
-    culture: 0.45,
+    civic: 0.65,
+    shops: 0.6,
+    retail: 0.5,
+    fitness: 0.5,
+    finance: 0.4,
+    culture: 0.4,
     recreation: 0.35,
     community: 0.35,
   };
@@ -977,7 +1044,7 @@ function destinationScore(point, source, radiusM) {
   }
 
   return {
-    score: clamp(weightedCategoryScore / 4.1, 0, 100),
+    score: clamp(weightedCategoryScore / 5.25, 0, 100),
     distance: nearest,
     categoryCount: categoryScores.size,
   };
@@ -1005,7 +1072,8 @@ function walkNetworkScore(point, layer) {
 }
 
 function layerScore(point, layer) {
-  if (layer.type === "destination") return destinationScore(point, layer.source, layer.radius);
+  if (layer.type === "categoryAccess") return categoryAccessScore(point, layer.source, layer.radius);
+  if (layer.type === "destinationPortfolio") return destinationPortfolioScore(point, layer.source, layer.radius);
   if (layer.type === "walkNetwork") return walkNetworkScore(point, layer);
   return nearLayerScore(point, layer);
 }
@@ -1037,10 +1105,12 @@ function scoreGrid(features, projection, bbox, activeLayerIds) {
     .map((id) => {
       const definition = layerDefinitions[id];
       if (!definition) return null;
+      const candidates = combineGroups(features, definition.groups)
+        .filter((candidate) => matchesLayerCategories(candidate, definition.categories));
       return {
         id,
         ...definition,
-        candidates: combineGroups(features, definition.groups),
+        candidates,
         fallbackCandidates: combineGroups(features, definition.fallbackGroups || []),
       };
     })
@@ -1088,6 +1158,7 @@ function scoreGrid(features, projection, bbox, activeLayerIds) {
         type: layer.type,
         featureCount: layer.candidates.length,
         categoryCount: result.categoryCount,
+        matchCount: result.matchCount,
       });
     }
 
@@ -1240,16 +1311,111 @@ function escapeHtml(str) {
 
 function summarizeFeatures(features) {
   const destinationTypes = new Set(features.destinations.map((point) => point.category).filter(Boolean)).size;
+  const destinationCounts = features.destinations.reduce((counts, point) => {
+    if (point.category) counts[point.category] = (counts[point.category] || 0) + 1;
+    return counts;
+  }, {});
   const names = [
     ["walk paths/sidewalks", features.pedestrianNetwork.length],
     ["crossing points", features.crossings.length],
     [`destinations across ${destinationTypes} types`, features.destinations.length],
+    ["grocery destinations", destinationCounts.groceries || 0],
+    ["fitness destinations", destinationCounts.fitness || 0],
     ["transit stops", features.transitStops.length],
     ["bike-network points", features.bikeNetwork.length],
     ["low-stress street points", features.lowStressBikeStreets.length],
     ["high-stress road points", features.highStressRoads.length],
   ];
   return names.map(([name, count]) => `${count.toLocaleString()} ${name}`).join("\n");
+}
+
+function clearGradientOverlay() {
+  if (heatLayer) {
+    map.removeLayer(heatLayer);
+    heatLayer = null;
+  }
+  lastGrid = [];
+}
+
+function gridStats(grid) {
+  if (!grid.length) return { avg: 0, min: 0, max: 0 };
+  const sum = grid.reduce((total, point) => total + point.score, 0);
+  return {
+    avg: sum / grid.length,
+    max: Math.max(...grid.map((point) => point.score)),
+    min: Math.min(...grid.map((point) => point.score)),
+  };
+}
+
+function applyScoredResult(scored, scan, heading) {
+  const parsed = scored.parsed;
+  lastFeatures = parsed;
+  lastProjection = parsed.projection;
+  renderFeatureLayer(parsed);
+
+  setStatus("Drawing the gradient overlay...");
+  lastGrid = scored.grid;
+  updateHeatLayer(lastGrid);
+
+  const stats = gridStats(lastGrid);
+  const scanRequestLine = scan
+    ? `Scan requests: ${scan.tileCount} total, ${scan.fetchedTileCount} new, ${scan.reusedTileCount} reused from this tab.\n`
+    : "";
+  setStatus(
+    `${heading}\nAverage score: ${stats.avg.toFixed(1)} / 100\nRange: ${stats.min.toFixed(1)}-${stats.max.toFixed(1)}\n` +
+    `Scoring: ${scored.usedWorker ? "background worker" : "main thread fallback"} (${Math.round(scored.elapsedMs).toLocaleString()} ms).\n` +
+    (scored.cache ? `Parsed cache: ${scored.cache.tileHits} reused, ${scored.cache.tileMisses} parsed.\n` : "") +
+    scanRequestLine +
+    `Tab cache: ${scanCache.size} saved scan request${scanCache.size === 1 ? "" : "s"}.\n\nFeatures used:\n${summarizeFeatures(parsed.features)}`
+  );
+}
+
+function scheduleRescoreFromLastScan(reason = "Layer selection changed.") {
+  window.clearTimeout(rescoreTimer);
+  rescoreTimer = window.setTimeout(() => {
+    rescoreFromLastScan(reason);
+  }, 180);
+}
+
+async function rescoreFromLastScan(reason = "Layer selection changed.") {
+  const ids = selectedLayerIds();
+
+  if (!ids.length) {
+    if (activeScoreController) {
+      activeScoreController.abort();
+      activeScoreController = null;
+    }
+    clearGradientOverlay();
+    setStatus("Select at least one scoring layer to draw a gradient.", "warn");
+    return;
+  }
+
+  if (!lastScan || !lastBbox) {
+    return;
+  }
+
+  if (activeFetchController) {
+    setStatus("Current scan is still loading. Layer changes will be used when it finishes.");
+    return;
+  }
+
+  if (activeScoreController) activeScoreController.abort();
+  const scoreController = new AbortController();
+  activeScoreController = scoreController;
+  scoreButton.disabled = true;
+  setStatus(`${reason}\nRe-scoring the saved scan without another Overpass request...`);
+
+  try {
+    const scored = await scoreOsmData(lastScan, lastBbox, ids, scoreController.signal);
+    applyScoredResult(scored, null, "Gradient updated from the saved scan.");
+  } catch (err) {
+    if (err.name !== "AbortError") {
+      setStatus(err.message || "Something went wrong while re-scoring.", "error");
+    }
+  } finally {
+    if (activeScoreController === scoreController) activeScoreController = null;
+    if (!activeFetchController && !activeScoreController) scoreButton.disabled = false;
+  }
 }
 
 async function calculate() {
@@ -1266,7 +1432,12 @@ async function calculate() {
     return;
   }
 
+  window.clearTimeout(rescoreTimer);
   if (activeFetchController) activeFetchController.abort();
+  if (activeScoreController) {
+    activeScoreController.abort();
+    activeScoreController = null;
+  }
   const fetchController = new AbortController();
   activeFetchController = fetchController;
   scoreButton.disabled = true;
@@ -1284,49 +1455,46 @@ async function calculate() {
       `${scan.fetchedTileCount} new request${scan.fetchedTileCount === 1 ? "" : "s"} fetched; ${scan.reusedTileCount} reused from this tab.\n` +
       `Building feature buckets and scoring in ${canUseScoringWorker() ? "a background worker" : "the main thread"}…`
     );
-    const scored = await scoreOsmData(scan, bbox, ids, fetchController.signal);
-    const parsed = scored.parsed;
-    lastFeatures = parsed;
-    lastProjection = parsed.projection;
-    renderFeatureLayer(parsed);
+    lastScan = scan;
+    lastBbox = bbox;
 
-    setStatus("Drawing the gradient overlay…");
-    lastGrid = scored.grid;
-    updateHeatLayer(lastGrid);
+    const scoreIds = selectedLayerIds();
+    if (!scoreIds.length) {
+      clearGradientOverlay();
+      setStatus("Scan loaded and saved in this tab. Select at least one scoring layer to draw a gradient.", "warn");
+      return;
+    }
 
-    const avg = lastGrid.reduce((sum, p) => sum + p.score, 0) / Math.max(1, lastGrid.length);
-    const max = Math.max(...lastGrid.map((p) => p.score));
-    const min = Math.min(...lastGrid.map((p) => p.score));
-    setStatus(
-      `Gradient complete.\nAverage score: ${avg.toFixed(1)} / 100\nRange: ${min.toFixed(1)}–${max.toFixed(1)}\n` +
-      `Scoring: ${scored.usedWorker ? "background worker" : "main thread fallback"} (${Math.round(scored.elapsedMs).toLocaleString()} ms).\n` +
-      (scored.cache ? `Parsed cache: ${scored.cache.tileHits} reused, ${scored.cache.tileMisses} parsed.\n` : "") +
-      `Scan requests: ${scan.tileCount} total, ${scan.fetchedTileCount} new, ${scan.reusedTileCount} reused from this tab.\n` +
-      `Tab cache: ${scanCache.size} saved scan request${scanCache.size === 1 ? "" : "s"}.\n\nFeatures used:\n${summarizeFeatures(parsed.features)}`
-    );
+    const scored = await scoreOsmData(scan, bbox, scoreIds, fetchController.signal);
+    applyScoredResult(scored, scan, "Gradient complete.");
   } catch (err) {
     if (err.name === "AbortError") return;
     setStatus(err.message || "Something went wrong while calculating.", "error");
   } finally {
-    if (activeFetchController === fetchController) activeFetchController = null;
-    scoreButton.disabled = false;
+    if (activeFetchController === fetchController) {
+      activeFetchController = null;
+      if (!activeScoreController) scoreButton.disabled = false;
+    }
   }
 }
 
 function clearMap() {
+  window.clearTimeout(rescoreTimer);
   if (activeFetchController) {
     activeFetchController.abort();
     activeFetchController = null;
     terminateScoringWorker();
   }
-  if (heatLayer) {
-    map.removeLayer(heatLayer);
-    heatLayer = null;
+  if (activeScoreController) {
+    activeScoreController.abort();
+    activeScoreController = null;
   }
+  clearGradientOverlay();
   featureLayer.clearLayers();
-  lastGrid = [];
   lastFeatures = null;
   lastProjection = null;
+  lastScan = null;
+  lastBbox = null;
   setStatus(`Cleared the overlay. ${scanCache.size} scan request${scanCache.size === 1 ? "" : "s"} are still saved in this tab.`);
 }
 
@@ -1351,7 +1519,11 @@ function inspectScore(e) {
   const rows = point.components
     .map((c) => {
       const dist = Number.isFinite(c.distance) ? `${Math.round(c.distance)} m` : "no data";
-      const detail = c.categoryCount === undefined ? dist : `${dist}; ${c.categoryCount} types`;
+      const detail = c.categoryCount !== undefined
+        ? `${dist}; ${c.categoryCount} types`
+        : c.matchCount !== undefined
+          ? `${dist}; ${c.matchCount} matches`
+          : dist;
       return `<tr><td>${escapeHtml(c.label)}</td><td>${c.score.toFixed(0)}</td><td>${detail}</td></tr>`;
     })
     .join("");
@@ -1381,7 +1553,23 @@ map.on("moveend", () => {
   }
 });
 
-document.getElementById("presetWalk").addEventListener("click", () => setSelectedLayers(walkPreset));
-document.getElementById("presetBike").addEventListener("click", () => setSelectedLayers(bikePreset));
-document.getElementById("presetBoth").addEventListener("click", () => setSelectedLayers([...walkPreset, ...bikePreset]));
-document.getElementById("presetClear").addEventListener("click", () => setSelectedLayers([]));
+document.querySelectorAll(".score-layer").forEach((el) => {
+  el.addEventListener("change", () => scheduleRescoreFromLastScan("Layer selection changed."));
+});
+
+document.getElementById("presetWalk").addEventListener("click", () => {
+  setSelectedLayers(walkPreset);
+  scheduleRescoreFromLastScan("Walkability preset applied.");
+});
+document.getElementById("presetBike").addEventListener("click", () => {
+  setSelectedLayers(bikePreset);
+  scheduleRescoreFromLastScan("Bikability preset applied.");
+});
+document.getElementById("presetBoth").addEventListener("click", () => {
+  setSelectedLayers([...walkPreset, ...bikePreset]);
+  scheduleRescoreFromLastScan("Combined preset applied.");
+});
+document.getElementById("presetClear").addEventListener("click", () => {
+  setSelectedLayers([]);
+  scheduleRescoreFromLastScan("Layer selection cleared.");
+});
