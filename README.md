@@ -23,11 +23,13 @@ http://localhost:8000
 3. Fetches one padded Overpass scan for the visible map area when it fits public-service limits.
 4. Uses fixed 1.7 km scan tiles only for larger areas, and keeps scan results in the browser cache.
 5. Converts selected walking/biking layers into cached feature buckets.
-6. Keeps completed gradient areas visible together instead of replacing older calculations.
-7. Saves completed gradients and scan tiles in IndexedDB so they can restore after restarting the browser.
-8. Re-scores saved scans automatically when layer checkboxes change, without another Overpass request when the cached scan tiles are available.
-9. Parses features and scores a physically even grid of map points from 0 to 100, using a Web Worker when served over HTTP.
-10. Renders a coarse draft gradient first, then replaces it with the full-resolution result.
+6. Scores a fixed global 100 m grid so repeated calculations line up by stable cell key instead of by zoom level.
+7. Keeps completed gradient areas visible together as one composited overlay instead of stacking transparent layers.
+8. In overlaps, draws coarser cells first, finer cells over them, and newer cells over older cells when resolution matches.
+9. Saves completed gradients and scan tiles in IndexedDB so they can restore after restarting the browser.
+10. Re-scores saved scans automatically when layer checkboxes change, without another Overpass request when the cached scan tiles are available.
+11. Parses features and scores map points from 0 to 100, using a Web Worker when served over HTTP.
+12. Renders a coarse draft gradient first, then replaces it with the full-resolution result.
 
 ## Current scoring layers
 

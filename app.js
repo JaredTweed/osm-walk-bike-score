@@ -8,7 +8,8 @@
 const DEFAULT_OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter";
 const EARTH_RADIUS_M = 6371008.8;
 const DENSIFY_STEP_M = 45;
-const GRID_TARGET_POINTS = 42;
+const SCORE_CELL_SIZE_M = 100;
+const DRAFT_SCORE_CELL_SIZE_M = 300;
 const SCAN_TILE_SIZE_M = 5000 / 3;
 const SCAN_TILE_LABEL = formatDistance(SCAN_TILE_SIZE_M);
 const SCAN_PADDING_EXTRA_M = 180;
@@ -40,9 +41,11 @@ L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
 }).addTo(map);
 
-let draftLayer = null;
+let compositeLayer = null;
+let draftArea = null;
 let featureLayer = L.layerGroup().addTo(map);
 let scoreAreas = [];
+let compositeGrid = [];
 let lastGrid = [];
 let lastFeatures = null;
 let lastProjection = null;
@@ -613,7 +616,7 @@ function canUseScoringWorker() {
 
 function getScoringWorker() {
   if (!scoringWorker) {
-    scoringWorker = new Worker("scoring-worker.js?v=20260605-scoremodel1");
+    scoringWorker = new Worker("scoring-worker.js?v=20260605-composite1");
   }
   return scoringWorker;
 }
@@ -751,6 +754,51 @@ function makeProjection(centerLat) {
 }
 
 function degToRad(deg) { return deg * Math.PI / 180; }
+function radToDeg(rad) { return rad * 180 / Math.PI; }
+
+function toGlobalMeters(lat, lng) {
+  const clampedLat = clamp(lat, -85.05112878, 85.05112878);
+  return {
+    x: EARTH_RADIUS_M * degToRad(lng),
+    y: EARTH_RADIUS_M * Math.log(Math.tan((Math.PI / 4) + (degToRad(clampedLat) / 2))),
+  };
+}
+
+function globalCellKey(xIndex, yIndex, cellSizeM) {
+  return `${Math.round(cellSizeM)}:${xIndex}:${yIndex}`;
+}
+
+function latIndexForCell(lat, cellSizeM) {
+  return Math.floor((EARTH_RADIUS_M * degToRad(lat)) / cellSizeM);
+}
+
+function latForCellIndex(yIndex, offset, cellSizeM) {
+  return radToDeg(((yIndex + offset) * cellSizeM) / EARTH_RADIUS_M);
+}
+
+function lngStepForCellRow(yIndex, cellSizeM) {
+  const centerLat = latForCellIndex(yIndex, 0.5, cellSizeM);
+  const denominator = EARTH_RADIUS_M * Math.max(0.2, Math.cos(degToRad(centerLat)));
+  return radToDeg(cellSizeM / denominator);
+}
+
+function globalCellCenter(xIndex, yIndex, cellSizeM) {
+  const lngStep = lngStepForCellRow(yIndex, cellSizeM);
+  return {
+    lat: latForCellIndex(yIndex, 0.5, cellSizeM),
+    lng: (xIndex + 0.5) * lngStep,
+  };
+}
+
+function globalCellBounds(xIndex, yIndex, cellSizeM) {
+  const lngStep = lngStepForCellRow(yIndex, cellSizeM);
+  return {
+    south: latForCellIndex(yIndex, 0, cellSizeM),
+    west: xIndex * lngStep,
+    north: latForCellIndex(yIndex, 1, cellSizeM),
+    east: (xIndex + 1) * lngStep,
+  };
+}
 
 function metersBetween(a, b) {
   const dx = a.x - b.x;
@@ -1192,29 +1240,48 @@ function layerScore(point, layer) {
   return nearLayerScore(point, layer);
 }
 
-function generateGrid(bbox, projection) {
-  const sw = projection.toXY(bbox.south, bbox.west);
-  const se = projection.toXY(bbox.south, bbox.east);
-  const nw = projection.toXY(bbox.north, bbox.west);
-  const widthM = Math.max(1, Math.abs(se.x - sw.x));
-  const heightM = Math.max(1, Math.abs(nw.y - sw.y));
-  const lngCount = GRID_TARGET_POINTS;
-  const latCount = clamp(Math.round((lngCount * heightM) / widthM), 18, 72);
+function generateGrid(bbox, projection, cellSizeM = SCORE_CELL_SIZE_M) {
+  const minYIndex = latIndexForCell(bbox.south, cellSizeM);
+  const maxYIndex = latIndexForCell(bbox.north - 1e-12, cellSizeM);
+  const latCount = Math.max(1, maxYIndex - minYIndex + 1);
+  let maxLngCount = 1;
   const grid = [];
 
-  for (let y = 0; y <= latCount; y++) {
-    const lat = bbox.south + ((bbox.north - bbox.south) * y) / latCount;
-    for (let x = 0; x <= lngCount; x++) {
-      const lng = bbox.west + ((bbox.east - bbox.west) * x) / lngCount;
-      grid.push({ lat, lng, xIndex: x, yIndex: y, ...projection.toXY(lat, lng), score: 0, components: [] });
+  for (let yIndex = minYIndex; yIndex <= maxYIndex; yIndex++) {
+    const lngStep = lngStepForCellRow(yIndex, cellSizeM);
+    const minXIndex = Math.floor(bbox.west / lngStep);
+    const maxXIndex = Math.floor((bbox.east - 1e-12) / lngStep);
+    maxLngCount = Math.max(maxLngCount, maxXIndex - minXIndex + 1);
+    for (let xIndex = minXIndex; xIndex <= maxXIndex; xIndex++) {
+      const center = globalCellCenter(xIndex, yIndex, cellSizeM);
+      grid.push({
+        lat: center.lat,
+        lng: center.lng,
+        xIndex,
+        yIndex,
+        cellKey: globalCellKey(xIndex, yIndex, cellSizeM),
+        cellSizeM,
+        bounds: globalCellBounds(xIndex, yIndex, cellSizeM),
+        ...projection.toXY(center.lat, center.lng),
+        score: 0,
+        components: [],
+      });
     }
   }
-  grid.meta = { bbox, lngCount, latCount };
+  grid.meta = {
+    bbox,
+    gridType: "fixed",
+    cellSizeM,
+    lngCount: maxLngCount,
+    latCount,
+    minYIndex,
+    maxYIndex,
+  };
   return grid;
 }
 
-function scoreGrid(features, projection, bbox, activeLayerIds) {
-  const grid = generateGrid(bbox, projection);
+function scoreGrid(features, projection, bbox, activeLayerIds, cellSizeM = SCORE_CELL_SIZE_M) {
+  const grid = generateGrid(bbox, projection, cellSizeM);
   const activeLayers = activeLayerIds
     .map((id) => {
       const definition = layerDefinitions[id];
@@ -1318,6 +1385,7 @@ const ScoreGridLayer = L.Layer.extend({
   onAdd(mapInstance) {
     this._map = mapInstance;
     this._canvas = L.DomUtil.create("canvas", "score-grid-layer leaflet-zoom-animated");
+    this._canvas.style.opacity = "0.52";
     this._ctx = this._canvas.getContext("2d");
     mapInstance.getPanes().overlayPane.appendChild(this._canvas);
     mapInstance.on("moveend zoomend resize viewreset", this._reset, this);
@@ -1344,10 +1412,10 @@ const ScoreGridLayer = L.Layer.extend({
     if (!this._ctx || !this.grid.length) return;
     const ctx = this._ctx;
     ctx.clearRect(0, 0, this._canvas.width, this._canvas.height);
-    ctx.globalAlpha = 0.52;
+    ctx.globalAlpha = 1;
 
     for (const point of this.grid) {
-      const bounds = scoreCellBounds(point, this.grid.meta);
+      const bounds = scoreCellBounds(point, point.meta || this.grid.meta);
       const nw = this._map.latLngToContainerPoint([bounds.north, bounds.west]);
       const se = this._map.latLngToContainerPoint([bounds.south, bounds.east]);
       const x = Math.min(nw.x, se.x);
@@ -1357,12 +1425,14 @@ const ScoreGridLayer = L.Layer.extend({
       ctx.fillStyle = scoreColor(point.score);
       ctx.fillRect(x, y, width, height);
     }
-
-    ctx.globalAlpha = 1;
   },
 });
 
 function scoreCellBounds(point, meta) {
+  if (point.bounds) return point.bounds;
+  if (meta?.gridType === "fixed" && Number.isFinite(point.xIndex) && Number.isFinite(point.yIndex)) {
+    return globalCellBounds(point.xIndex, point.yIndex, point.cellSizeM || meta.cellSizeM || SCORE_CELL_SIZE_M);
+  }
   const { bbox, lngCount, latCount } = meta;
   const latStep = (bbox.north - bbox.south) / latCount;
   const lngStep = (bbox.east - bbox.west) / lngCount;
@@ -1372,6 +1442,20 @@ function scoreCellBounds(point, meta) {
     west: clamp(point.lng - (lngStep / 2), bbox.west, bbox.east),
     east: clamp(point.lng + (lngStep / 2), bbox.west, bbox.east),
   };
+}
+
+function estimateLegacyCellSizeM(meta) {
+  if (!meta?.bbox) return SCORE_CELL_SIZE_M;
+  const centerLat = (meta.bbox.north + meta.bbox.south) / 2;
+  const west = toGlobalMeters(centerLat, meta.bbox.west);
+  const east = toGlobalMeters(centerLat, meta.bbox.east);
+  const south = toGlobalMeters(meta.bbox.south, meta.bbox.west);
+  const north = toGlobalMeters(meta.bbox.north, meta.bbox.west);
+  const widthM = Math.abs(east.x - west.x);
+  const heightM = Math.abs(north.y - south.y);
+  const lngCellM = widthM / Math.max(1, meta.lngCount || 1);
+  const latCellM = heightM / Math.max(1, meta.latCount || 1);
+  return Math.max(1, Math.min(lngCellM || SCORE_CELL_SIZE_M, latCellM || SCORE_CELL_SIZE_M));
 }
 
 function makeAreaId() {
@@ -1409,6 +1493,9 @@ function serializeGrid(grid) {
     lng: point.lng,
     xIndex: point.xIndex,
     yIndex: point.yIndex,
+    cellKey: point.cellKey,
+    cellSizeM: point.cellSizeM,
+    bounds: point.bounds,
     score: point.score,
     components: compactComponents(point.components),
   }));
@@ -1422,6 +1509,13 @@ function normalizeGrid(grid, gridMeta, projectionCenterLat) {
     lng: point.lng,
     xIndex: point.xIndex,
     yIndex: point.yIndex,
+    cellKey: point.cellKey || (gridMeta.gridType === "fixed"
+      ? globalCellKey(point.xIndex, point.yIndex, point.cellSizeM || gridMeta.cellSizeM || SCORE_CELL_SIZE_M)
+      : null),
+    cellSizeM: point.cellSizeM || gridMeta.cellSizeM || estimateLegacyCellSizeM(gridMeta),
+    bounds: point.bounds || (gridMeta.gridType === "fixed"
+      ? globalCellBounds(point.xIndex, point.yIndex, point.cellSizeM || gridMeta.cellSizeM || SCORE_CELL_SIZE_M)
+      : null),
     score: point.score,
     components: (point.components || []).map((component) => ({
       ...component,
@@ -1431,8 +1525,14 @@ function normalizeGrid(grid, gridMeta, projectionCenterLat) {
   }));
   normalized.meta = {
     bbox: cloneBbox(gridMeta.bbox),
+    gridType: gridMeta.gridType || "legacy",
+    cellSizeM: gridMeta.cellSizeM || estimateLegacyCellSizeM(gridMeta),
     lngCount: gridMeta.lngCount,
     latCount: gridMeta.latCount,
+    minXIndex: gridMeta.minXIndex,
+    maxXIndex: gridMeta.maxXIndex,
+    minYIndex: gridMeta.minYIndex,
+    maxYIndex: gridMeta.maxYIndex,
   };
   return normalized;
 }
@@ -1454,7 +1554,6 @@ function normalizeStoredScoreArea(stored) {
     layerIds: stored.layerIds || [],
     scanTileKeys: stored.scanTileKeys || [],
     stats: stored.stats || gridStats(grid),
-    layer: null,
   };
 }
 
@@ -1508,7 +1607,7 @@ function scanFromArea(area) {
 
 function createScoreArea(scored, scan, bbox, layerIds) {
   const grid = scored.grid;
-  const gridMeta = grid.meta || { bbox, lngCount: GRID_TARGET_POINTS, latCount: GRID_TARGET_POINTS };
+  const gridMeta = grid.meta || { bbox, gridType: "fixed", cellSizeM: SCORE_CELL_SIZE_M, lngCount: 1, latCount: 1 };
   return {
     id: makeAreaId(),
     createdAt: Date.now(),
@@ -1519,7 +1618,6 @@ function createScoreArea(scored, scan, bbox, layerIds) {
     layerIds: [...layerIds],
     scanTileKeys: (scan?.requests || []).map((request) => request.key),
     stats: gridStats(grid),
-    layer: null,
   };
 }
 
@@ -1530,33 +1628,84 @@ function setLastArea(area, scan = null) {
   lastScan = scan || scanFromArea(area);
 }
 
-function addAreaLayer(area) {
-  if (!overlayVisible || area.layer) return;
-  area.layer = new ScoreGridLayer(area.grid).addTo(map);
+function cellResolutionM(point, area) {
+  return point.cellSizeM || area.grid?.meta?.cellSizeM || area.gridMeta?.cellSizeM || estimateLegacyCellSizeM(area.grid?.meta || area.gridMeta);
 }
 
-function removeAreaLayer(area) {
-  if (!area.layer) return;
-  map.removeLayer(area.layer);
-  area.layer = null;
+function compositeCellForPoint(point, area) {
+  const meta = area.grid?.meta || area.gridMeta;
+  const bounds = scoreCellBounds(point, meta);
+  return {
+    ...point,
+    bounds,
+    meta,
+    sourceAreaId: area.id,
+    sourceCreatedAt: area.createdAt || 0,
+    sourceResolutionM: cellResolutionM(point, area),
+  };
 }
 
 function clearDraftLayer() {
-  if (!draftLayer) return;
-  map.removeLayer(draftLayer);
-  draftLayer = null;
+  if (!draftArea) return;
+  draftArea = null;
+  renderScoreAreas();
 }
 
 function showDraftGrid(grid) {
-  clearDraftLayer();
-  if (overlayVisible) draftLayer = new ScoreGridLayer(grid).addTo(map);
+  draftArea = {
+    id: "draft",
+    createdAt: Date.now() + 1,
+    bbox: cloneBbox(grid.meta.bbox),
+    grid,
+    gridMeta: grid.meta,
+    projectionCenterLat: projectionCenterForBbox(grid.meta.bbox),
+    layerIds: selectedLayerIds(),
+    scanTileKeys: [],
+    stats: gridStats(grid),
+    transient: true,
+  };
+  renderScoreAreas();
+}
+
+function buildCompositeGrid() {
+  const keyedCells = new Map();
+  const unkeyedCells = [];
+  for (const area of [...scoreAreas, ...(draftArea ? [draftArea] : [])]) {
+    for (const point of area.grid || []) {
+      const cell = compositeCellForPoint(point, area);
+      if (!cell.cellKey) {
+        unkeyedCells.push(cell);
+        continue;
+      }
+      const existing = keyedCells.get(cell.cellKey);
+      if (!existing || compositeCellWins(cell, existing)) keyedCells.set(cell.cellKey, cell);
+    }
+  }
+
+  const cells = [...unkeyedCells, ...keyedCells.values()];
+  cells.sort((a, b) => {
+    const resolutionDelta = (b.sourceResolutionM || SCORE_CELL_SIZE_M) - (a.sourceResolutionM || SCORE_CELL_SIZE_M);
+    if (Math.abs(resolutionDelta) > 1) return resolutionDelta;
+    return (a.sourceCreatedAt || 0) - (b.sourceCreatedAt || 0);
+  });
+  cells.meta = { composite: true };
+  return cells;
+}
+
+function compositeCellWins(candidate, existing) {
+  const resolutionDelta = (existing.sourceResolutionM || SCORE_CELL_SIZE_M) - (candidate.sourceResolutionM || SCORE_CELL_SIZE_M);
+  if (Math.abs(resolutionDelta) > 1) return resolutionDelta > 0;
+  return (candidate.sourceCreatedAt || 0) >= (existing.sourceCreatedAt || 0);
 }
 
 function renderScoreAreas() {
-  clearDraftLayer();
-  for (const area of scoreAreas) {
-    if (overlayVisible) addAreaLayer(area);
-    else removeAreaLayer(area);
+  if (compositeLayer) {
+    map.removeLayer(compositeLayer);
+    compositeLayer = null;
+  }
+  compositeGrid = buildCompositeGrid();
+  if (overlayVisible && compositeGrid.length) {
+    compositeLayer = new ScoreGridLayer(compositeGrid).addTo(map);
   }
   updateOverlayButton();
 }
@@ -1581,14 +1730,13 @@ function setOverlayVisible(visible) {
 
 function addScoreArea(area) {
   scoreAreas.push(area);
-  addAreaLayer(area);
   setLastArea(area);
   persistScoreArea(area);
+  renderScoreAreas();
   return area;
 }
 
 function updateScoreArea(area, scored, scan, layerIds) {
-  removeAreaLayer(area);
   area.grid = scored.grid;
   area.gridMeta = scored.grid.meta;
   area.bbox = cloneBbox(scored.grid.meta.bbox);
@@ -1596,9 +1744,9 @@ function updateScoreArea(area, scored, scan, layerIds) {
   area.layerIds = [...layerIds];
   area.scanTileKeys = (scan?.requests || area.scanTileKeys || []).map((request) => request.key || request);
   area.stats = gridStats(area.grid);
-  addAreaLayer(area);
   setLastArea(area, scan);
   persistScoreArea(area);
+  renderScoreAreas();
   return area;
 }
 
@@ -1668,10 +1816,15 @@ function summarizeFeatures(features) {
 
 function clearGradientOverlay() {
   closeScorePopup();
-  clearDraftLayer();
-  for (const area of scoreAreas) removeAreaLayer(area);
+  draftArea = null;
+  if (compositeLayer) {
+    map.removeLayer(compositeLayer);
+    compositeLayer = null;
+  }
   scoreAreas = [];
+  compositeGrid = [];
   lastGrid = [];
+  renderScoreAreas();
   clearStore(SCORE_AREAS_STORE);
 }
 
@@ -1868,30 +2021,47 @@ function clearMap() {
 }
 
 function nearestGridPoint(latlng) {
-  if (!overlayVisible || !scoreAreas.length) return null;
-  let best = null;
+  if (!overlayVisible || !compositeGrid.length) return null;
+
+  for (let i = compositeGrid.length - 1; i >= 0; i--) {
+    const point = compositeGrid[i];
+    if (boundsContainsLatLng(point.bounds || scoreCellBounds(point, point.meta), latlng)) {
+      const d = distanceLatLngM(latlng, point);
+      return { point, area: scoreAreas.find((area) => area.id === point.sourceAreaId) || null, distance: d };
+    }
+  }
+
+  const clickMeters = toGlobalMeters(latlng.lat, latlng.lng);
   let bestDist = Infinity;
-  for (const area of scoreAreas) {
-    if (!bboxContainsLatLng(area.bbox, latlng)) continue;
-    const projection = makeProjection(area.projectionCenterLat);
-    const p = { lat: latlng.lat, lng: latlng.lng, ...projection.toXY(latlng.lat, latlng.lng) };
-    for (const g of area.grid) {
-      const d = metersBetween(p, g);
-      if (d < bestDist) {
-        bestDist = d;
-        best = { point: g, area };
-      }
+  let best = null;
+  for (let i = compositeGrid.length - 1; i >= 0; i--) {
+    const point = compositeGrid[i];
+    const pointMeters = toGlobalMeters(point.lat, point.lng);
+    const dx = clickMeters.x - pointMeters.x;
+    const dy = clickMeters.y - pointMeters.y;
+    const d = Math.sqrt((dx * dx) + (dy * dy));
+    if (d < bestDist) {
+      bestDist = d;
+      best = { point, area: scoreAreas.find((area) => area.id === point.sourceAreaId) || null };
     }
   }
   return best ? { ...best, distance: bestDist } : null;
 }
 
-function bboxContainsLatLng(bbox, latlng) {
-  if (!bbox) return false;
-  return latlng.lat >= bbox.south &&
-    latlng.lat <= bbox.north &&
-    latlng.lng >= bbox.west &&
-    latlng.lng <= bbox.east;
+function boundsContainsLatLng(bounds, latlng) {
+  if (!bounds) return false;
+  return latlng.lat >= bounds.south &&
+    latlng.lat <= bounds.north &&
+    latlng.lng >= bounds.west &&
+    latlng.lng <= bounds.east;
+}
+
+function distanceLatLngM(a, b) {
+  const aMeters = toGlobalMeters(a.lat, a.lng);
+  const bMeters = toGlobalMeters(b.lat, b.lng);
+  const dx = aMeters.x - bMeters.x;
+  const dy = aMeters.y - bMeters.y;
+  return Math.sqrt((dx * dx) + (dy * dy));
 }
 
 function closeScorePopup() {
@@ -1901,7 +2071,7 @@ function closeScorePopup() {
 }
 
 function inspectScore(e) {
-  if (!clickInspectEl.checked || !scoreAreas.length || !overlayVisible) return;
+  if (!clickInspectEl.checked || !compositeGrid.length || !overlayVisible) return;
   const found = nearestGridPoint(e.latlng);
   if (!found) return;
   const { point } = found;

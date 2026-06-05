@@ -1,7 +1,7 @@
 const EARTH_RADIUS_M = 6371008.8;
 const DENSIFY_STEP_M = 45;
-const GRID_TARGET_POINTS = 42;
-const DRAFT_GRID_TARGET_POINTS = 18;
+const SCORE_CELL_SIZE_M = 100;
+const DRAFT_SCORE_CELL_SIZE_M = 300;
 
 let layerDefinitions = {};
 const tileElementKeysCache = new Map();
@@ -29,7 +29,7 @@ self.addEventListener("message", (event) => {
       jobId: message.jobId,
       message: "Scoring a fast draft grid in a background worker...",
     });
-    const draftGrid = scoreGrid(parsed.features, parsed.projection, message.bbox, message.activeLayerIds, DRAFT_GRID_TARGET_POINTS);
+    const draftGrid = scoreGrid(parsed.features, parsed.projection, message.bbox, message.activeLayerIds, DRAFT_SCORE_CELL_SIZE_M);
     self.postMessage({
       type: "partial",
       jobId: message.jobId,
@@ -43,7 +43,7 @@ self.addEventListener("message", (event) => {
       jobId: message.jobId,
       message: "Refining the full-resolution grid in a background worker...",
     });
-    const grid = scoreGrid(parsed.features, parsed.projection, message.bbox, message.activeLayerIds, GRID_TARGET_POINTS);
+    const grid = scoreGrid(parsed.features, parsed.projection, message.bbox, message.activeLayerIds, SCORE_CELL_SIZE_M);
     const gridMeta = grid.meta;
 
     self.postMessage({
@@ -210,6 +210,51 @@ function makeProjection(centerLat) {
 }
 
 function degToRad(deg) { return deg * Math.PI / 180; }
+function radToDeg(rad) { return rad * 180 / Math.PI; }
+
+function toGlobalMeters(lat, lng) {
+  const clampedLat = clamp(lat, -85.05112878, 85.05112878);
+  return {
+    x: EARTH_RADIUS_M * degToRad(lng),
+    y: EARTH_RADIUS_M * Math.log(Math.tan((Math.PI / 4) + (degToRad(clampedLat) / 2))),
+  };
+}
+
+function globalCellKey(xIndex, yIndex, cellSizeM) {
+  return `${Math.round(cellSizeM)}:${xIndex}:${yIndex}`;
+}
+
+function latIndexForCell(lat, cellSizeM) {
+  return Math.floor((EARTH_RADIUS_M * degToRad(lat)) / cellSizeM);
+}
+
+function latForCellIndex(yIndex, offset, cellSizeM) {
+  return radToDeg(((yIndex + offset) * cellSizeM) / EARTH_RADIUS_M);
+}
+
+function lngStepForCellRow(yIndex, cellSizeM) {
+  const centerLat = latForCellIndex(yIndex, 0.5, cellSizeM);
+  const denominator = EARTH_RADIUS_M * Math.max(0.2, Math.cos(degToRad(centerLat)));
+  return radToDeg(cellSizeM / denominator);
+}
+
+function globalCellCenter(xIndex, yIndex, cellSizeM) {
+  const lngStep = lngStepForCellRow(yIndex, cellSizeM);
+  return {
+    lat: latForCellIndex(yIndex, 0.5, cellSizeM),
+    lng: (xIndex + 0.5) * lngStep,
+  };
+}
+
+function globalCellBounds(xIndex, yIndex, cellSizeM) {
+  const lngStep = lngStepForCellRow(yIndex, cellSizeM);
+  return {
+    south: latForCellIndex(yIndex, 0, cellSizeM),
+    west: xIndex * lngStep,
+    north: latForCellIndex(yIndex, 1, cellSizeM),
+    east: (xIndex + 1) * lngStep,
+  };
+}
 
 function metersBetween(a, b) {
   const dx = a.x - b.x;
@@ -652,29 +697,48 @@ function layerScore(point, layer) {
   return nearLayerScore(point, layer);
 }
 
-function generateGrid(bbox, projection, targetPoints = GRID_TARGET_POINTS) {
-  const sw = projection.toXY(bbox.south, bbox.west);
-  const se = projection.toXY(bbox.south, bbox.east);
-  const nw = projection.toXY(bbox.north, bbox.west);
-  const widthM = Math.max(1, Math.abs(se.x - sw.x));
-  const heightM = Math.max(1, Math.abs(nw.y - sw.y));
-  const lngCount = targetPoints;
-  const latCount = clamp(Math.round((lngCount * heightM) / widthM), Math.max(10, Math.round(targetPoints * 0.45)), Math.max(24, Math.round(targetPoints * 1.7)));
+function generateGrid(bbox, projection, cellSizeM = SCORE_CELL_SIZE_M) {
+  const minYIndex = latIndexForCell(bbox.south, cellSizeM);
+  const maxYIndex = latIndexForCell(bbox.north - 1e-12, cellSizeM);
+  const latCount = Math.max(1, maxYIndex - minYIndex + 1);
+  let maxLngCount = 1;
   const grid = [];
 
-  for (let y = 0; y <= latCount; y++) {
-    const lat = bbox.south + ((bbox.north - bbox.south) * y) / latCount;
-    for (let x = 0; x <= lngCount; x++) {
-      const lng = bbox.west + ((bbox.east - bbox.west) * x) / lngCount;
-      grid.push({ lat, lng, xIndex: x, yIndex: y, ...projection.toXY(lat, lng), score: 0, components: [] });
+  for (let yIndex = minYIndex; yIndex <= maxYIndex; yIndex++) {
+    const lngStep = lngStepForCellRow(yIndex, cellSizeM);
+    const minXIndex = Math.floor(bbox.west / lngStep);
+    const maxXIndex = Math.floor((bbox.east - 1e-12) / lngStep);
+    maxLngCount = Math.max(maxLngCount, maxXIndex - minXIndex + 1);
+    for (let xIndex = minXIndex; xIndex <= maxXIndex; xIndex++) {
+      const center = globalCellCenter(xIndex, yIndex, cellSizeM);
+      grid.push({
+        lat: center.lat,
+        lng: center.lng,
+        xIndex,
+        yIndex,
+        cellKey: globalCellKey(xIndex, yIndex, cellSizeM),
+        cellSizeM,
+        bounds: globalCellBounds(xIndex, yIndex, cellSizeM),
+        ...projection.toXY(center.lat, center.lng),
+        score: 0,
+        components: [],
+      });
     }
   }
-  grid.meta = { bbox, lngCount, latCount };
+  grid.meta = {
+    bbox,
+    gridType: "fixed",
+    cellSizeM,
+    lngCount: maxLngCount,
+    latCount,
+    minYIndex,
+    maxYIndex,
+  };
   return grid;
 }
 
-function scoreGrid(features, projection, bbox, activeLayerIds, targetPoints = GRID_TARGET_POINTS) {
-  const grid = generateGrid(bbox, projection, targetPoints);
+function scoreGrid(features, projection, bbox, activeLayerIds, cellSizeM = SCORE_CELL_SIZE_M) {
+  const grid = generateGrid(bbox, projection, cellSizeM);
   const activeLayers = activeLayerIds
     .map((id) => {
       const definition = layerDefinitions[id];
