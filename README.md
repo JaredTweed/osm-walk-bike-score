@@ -22,9 +22,10 @@ http://localhost:8000
 2. Uses OpenStreetMap raster tiles for the base map.
 3. Fetches one padded Overpass scan for the visible map area when it fits public-service limits.
 4. Uses fixed 1.7 km scan tiles only for larger areas, and keeps scan results in memory while the tab is open.
-5. Converts selected walking/biking layers into feature buckets.
+5. Converts selected walking/biking layers into cached feature buckets.
 6. Parses features and scores a physically even grid of map points from 0 to 100, using a Web Worker when served over HTTP.
-7. Renders a red-to-green score overlay directly from those scores.
+7. Renders a coarse draft gradient first, then replaces it with the full-resolution result.
+8. Supports a configurable Overpass-compatible endpoint, so a local/private backend can run limited parallel fetches.
 
 ## Current scoring layers
 
@@ -63,11 +64,13 @@ This is not an official accessibility, safety, or transportation model. It does 
 - missing or incorrectly tagged OSM data
 - very large scans beyond a city-sized view; those are still blocked to avoid overloading public Overpass service
 - faster CPU scoring requires serving the app over HTTP; direct `file://` loading falls back to main-thread scoring because browsers often block local Web Workers
+- public Overpass requests remain serial by design; parallel fetching is enabled only for custom/private endpoints to avoid rate-limit slowdowns
 
 For production use, consider:
 
 - hosting your own tiles or using a commercial tile provider
 - caching Overpass responses or importing OSM data into PostGIS
+- pointing the endpoint field at a local Overpass instance or an Overpass-compatible proxy backed by imported OSM data
 - replacing the simple distance model with a routable network model
 - calibrating weights against local policy goals or survey data
 - adding official municipal open data for sidewalks, traffic volumes, collisions, speed limits, cycling facilities, and transit frequency

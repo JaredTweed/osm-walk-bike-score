@@ -5,7 +5,7 @@
   - Scores a regular grid of points and renders it as a red-to-green overlay.
 */
 
-const OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter";
+const DEFAULT_OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter";
 const EARTH_RADIUS_M = 6371008.8;
 const DENSIFY_STEP_M = 45;
 const GRID_TARGET_POINTS = 42;
@@ -18,6 +18,7 @@ const MAX_SINGLE_SCAN_LNG_SPAN_DEG = 0.50;
 const MAX_SCAN_TILES = 900;
 const SCAN_TILE_DELAY_MS = 450;
 const OVERPASS_RETRY_DELAYS_MS = [1800, 4500];
+const CUSTOM_ENDPOINT_MAX_CONCURRENCY = 4;
 
 const map = L.map("map", {
   zoomControl: true,
@@ -42,13 +43,16 @@ let lastProjection = null;
 let activeFetchController = null;
 let scoringWorker = null;
 let scoringWorkerJobId = 0;
+let overpassEndpoint = localStorage.getItem("overpassEndpoint") || DEFAULT_OVERPASS_ENDPOINT;
 const scanCache = new Map();
+const workerCachedScanKeys = new Set();
 
 const statusEl = document.getElementById("status");
 const scoreButton = document.getElementById("scoreButton");
 const clearButton = document.getElementById("clearButton");
 const showFeaturesEl = document.getElementById("showFeatures");
 const clickInspectEl = document.getElementById("clickInspect");
+const overpassEndpointEl = document.getElementById("overpassEndpoint");
 
 const layerDefinitions = {
   "walk-network": {
@@ -145,6 +149,24 @@ const bikePreset = ["bike-network", "bike-low-stress", "bike-parking", "bike-cal
 const MAX_SCORE_RADIUS_M = Math.max(...Object.values(layerDefinitions).map((layer) => layer.radius || 0));
 const SCAN_PADDING_M = MAX_SCORE_RADIUS_M + SCAN_PADDING_EXTRA_M;
 
+if (overpassEndpointEl) {
+  overpassEndpointEl.value = overpassEndpoint;
+  overpassEndpointEl.placeholder = DEFAULT_OVERPASS_ENDPOINT;
+  overpassEndpointEl.addEventListener("change", () => {
+    const nextEndpoint = normalizeEndpoint(overpassEndpointEl.value);
+    overpassEndpointEl.value = nextEndpoint;
+    if (nextEndpoint === overpassEndpoint) return;
+    overpassEndpoint = nextEndpoint;
+    if (overpassEndpoint === DEFAULT_OVERPASS_ENDPOINT) {
+      localStorage.removeItem("overpassEndpoint");
+    } else {
+      localStorage.setItem("overpassEndpoint", overpassEndpoint);
+    }
+    resetScanCaches();
+    setStatus(`Overpass endpoint updated. Scan cache cleared. Fetch concurrency is ${scanConcurrency()}.`);
+  });
+}
+
 function setStatus(message, level = "") {
   statusEl.textContent = message;
   statusEl.className = `status ${level}`.trim();
@@ -159,6 +181,43 @@ function setSelectedLayers(ids) {
   document.querySelectorAll(".score-layer").forEach((el) => {
     el.checked = chosen.has(el.value);
   });
+}
+
+function normalizeEndpoint(value) {
+  const trimmed = String(value || "").trim();
+  return trimmed || DEFAULT_OVERPASS_ENDPOINT;
+}
+
+function endpointHost(endpoint) {
+  try {
+    return new URL(endpoint).hostname;
+  } catch {
+    return "";
+  }
+}
+
+function isPublicOverpassEndpoint() {
+  const host = endpointHost(overpassEndpoint);
+  return !host || host === "overpass-api.de" || host.endsWith(".overpass-api.de");
+}
+
+function scanConcurrency() {
+  if (isPublicOverpassEndpoint()) return 1;
+  return Math.max(2, Math.min(CUSTOM_ENDPOINT_MAX_CONCURRENCY, navigator.hardwareConcurrency || 2));
+}
+
+function scanDelayMs() {
+  return isPublicOverpassEndpoint() ? SCAN_TILE_DELAY_MS : 0;
+}
+
+function resetScanCaches() {
+  if (activeFetchController) {
+    activeFetchController.abort();
+    activeFetchController = null;
+  }
+  scanCache.clear();
+  workerCachedScanKeys.clear();
+  terminateScoringWorker();
 }
 
 function formatDistance(meters) {
@@ -301,7 +360,7 @@ async function fetchOsmData(bbox, signal) {
   const body = new URLSearchParams({ data: buildOverpassQuery(bbox) });
 
   for (let attempt = 0; attempt <= OVERPASS_RETRY_DELAYS_MS.length; attempt++) {
-    const response = await fetch(OVERPASS_ENDPOINT, {
+    const response = await fetch(overpassEndpoint, {
       method: "POST",
       body,
       signal,
@@ -343,48 +402,74 @@ async function scanOsmData(bbox, signal) {
   }
 
   const missingTiles = plan.tiles.filter((tile) => !scanCache.has(tile.key));
-  for (let i = 0; i < missingTiles.length; i++) {
-    if (signal.aborted) throw new DOMException("Scan aborted", "AbortError");
-    const tile = missingTiles[i];
-    setStatus(
-      `Scanning visible area with ${plan.mode === "single" ? "one padded request" : `fixed ${SCAN_TILE_LABEL} reusable tiles`}…\n` +
-      `Request ${i + 1} of ${missingTiles.length} new; ${plan.tiles.length - missingTiles.length} reused from this tab.\n` +
-      `Total scan requests for this view: ${plan.tiles.length}.`
-    );
-    const osmJson = await fetchOsmData(tile.bbox, signal);
-    scanCache.set(tile.key, {
-      bbox: tile.bbox,
-      osmJson,
-      elementCount: Number(osmJson.elements?.length || 0),
-      fetchedAt: Date.now(),
-    });
-    if (i < missingTiles.length - 1) await wait(SCAN_TILE_DELAY_MS, signal);
-  }
+  await fetchMissingScanTiles(missingTiles, plan, signal);
 
   return mergeScanTiles(plan.tiles, missingTiles.length);
 }
 
+async function fetchMissingScanTiles(missingTiles, plan, signal) {
+  if (!missingTiles.length) return;
+
+  const concurrency = Math.min(scanConcurrency(), missingTiles.length);
+  const delayMs = scanDelayMs();
+  let nextIndex = 0;
+  let completed = 0;
+
+  async function runFetcher() {
+    while (nextIndex < missingTiles.length) {
+      if (signal.aborted) throw new DOMException("Scan aborted", "AbortError");
+      const index = nextIndex++;
+      const tile = missingTiles[index];
+      setStatus(
+        `Scanning visible area with ${plan.mode === "single" ? "one padded request" : `fixed ${SCAN_TILE_LABEL} reusable tiles`}…\n` +
+        `Completed ${completed} of ${missingTiles.length} new request${missingTiles.length === 1 ? "" : "s"}; ${plan.tiles.length - missingTiles.length} reused from this tab.\n` +
+        `Active fetches: ${concurrency}. Total scan requests for this view: ${plan.tiles.length}.`
+      );
+      const osmJson = await fetchOsmData(tile.bbox, signal);
+      scanCache.set(tile.key, {
+        bbox: tile.bbox,
+        osmJson,
+        elementCount: Number(osmJson.elements?.length || 0),
+        fetchedAt: Date.now(),
+      });
+      completed++;
+      if (delayMs && nextIndex < missingTiles.length) await wait(delayMs, signal);
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, runFetcher));
+}
+
 function mergeScanTiles(tiles, fetchedTileCount) {
-  const elementsByKey = new Map();
+  const buildMergedOsm = !canUseScoringWorker();
+  const elementsByKey = buildMergedOsm ? new Map() : null;
   let rawElementCount = 0;
+  const requests = [];
 
   for (const tile of tiles) {
     const cached = scanCache.get(tile.key);
     if (!cached) continue;
+    requests.push({
+      key: tile.key,
+      bbox: cached.bbox,
+      osmJson: cached.osmJson,
+      elementCount: cached.elementCount,
+    });
     for (const el of cached.osmJson.elements || []) {
       rawElementCount++;
-      elementsByKey.set(`${el.type}/${el.id}`, el);
+      if (elementsByKey) elementsByKey.set(`${el.type}/${el.id}`, el);
     }
   }
 
   return {
-    osmJson: { elements: [...elementsByKey.values()] },
+    osmJson: { elements: elementsByKey ? [...elementsByKey.values()] : [] },
+    requests,
     tileCount: tiles.length,
     mode: tiles.length === 1 ? "single" : "tiled",
     fetchedTileCount,
     reusedTileCount: tiles.length - fetchedTileCount,
     rawElementCount,
-    uniqueElementCount: elementsByKey.size,
+    uniqueElementCount: elementsByKey ? elementsByKey.size : null,
   };
 }
 
@@ -394,7 +479,7 @@ function canUseScoringWorker() {
 
 function getScoringWorker() {
   if (!scoringWorker) {
-    scoringWorker = new Worker("scoring-worker.js?v=20260604-worker1");
+    scoringWorker = new Worker("scoring-worker.js?v=20260605-fast1");
   }
   return scoringWorker;
 }
@@ -403,23 +488,29 @@ function terminateScoringWorker() {
   if (!scoringWorker) return;
   scoringWorker.terminate();
   scoringWorker = null;
+  workerCachedScanKeys.clear();
 }
 
-function scoreOsmData(osmJson, bbox, activeLayerIds, signal) {
+function scoreOsmData(scan, bbox, activeLayerIds, signal) {
   if (!canUseScoringWorker()) {
     const startedAt = performance.now();
-    const parsed = parseFeatures(osmJson, bbox);
+    const parsed = parseFeatures(scan.osmJson, bbox);
     const grid = scoreGrid(parsed.features, parsed.projection, bbox, activeLayerIds);
     return Promise.resolve({
       parsed,
       grid,
       elapsedMs: performance.now() - startedAt,
       usedWorker: false,
+      cache: null,
     });
   }
 
   const worker = getScoringWorker();
   const jobId = ++scoringWorkerJobId;
+  const scanRequests = scan.requests.map((request) => {
+    if (!workerCachedScanKeys.has(request.key)) return request;
+    return { key: request.key, bbox: request.bbox, elementCount: request.elementCount };
+  });
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -456,6 +547,19 @@ function scoreOsmData(osmJson, bbox, activeLayerIds, signal) {
         return;
       }
 
+      if (message.type === "partial") {
+        const projection = makeProjection(message.projectionCenterLat);
+        message.grid.meta = message.gridMeta;
+        lastProjection = projection;
+        lastGrid = message.grid;
+        updateHeatLayer(lastGrid);
+        setStatus(
+          `Showing a fast draft gradient while final scoring continues…\n` +
+          `Draft grid: ${lastGrid.length.toLocaleString()} points.`
+        );
+        return;
+      }
+
       if (message.type === "error") {
         finish(reject, new Error(message.message || "Worker scoring failed."));
         return;
@@ -465,11 +569,13 @@ function scoreOsmData(osmJson, bbox, activeLayerIds, signal) {
 
       const projection = makeProjection(message.projectionCenterLat);
       message.grid.meta = message.gridMeta;
+      for (const key of message.parsedScanKeys || []) workerCachedScanKeys.add(key);
       finish(resolve, {
         parsed: { features: message.features, projection },
         grid: message.grid,
         elapsedMs: message.elapsedMs,
         usedWorker: true,
+        cache: message.cache,
       });
     }
 
@@ -485,7 +591,8 @@ function scoreOsmData(osmJson, bbox, activeLayerIds, signal) {
       worker.postMessage({
         type: "score",
         jobId,
-        osmJson,
+        osmJson: scan.osmJson,
+        scanRequests,
         bbox,
         activeLayerIds,
         layerDefinitions,
@@ -1169,12 +1276,15 @@ async function calculate() {
 
   try {
     const scan = await scanOsmData(bbox, fetchController.signal);
+    const elementSummary = scan.uniqueElementCount === null
+      ? `${scan.rawElementCount.toLocaleString()} OSM element references`
+      : `${scan.uniqueElementCount.toLocaleString()} unique OSM elements`;
     setStatus(
-      `Loaded ${scan.uniqueElementCount.toLocaleString()} unique OSM elements from ${scan.tileCount} scan request${scan.tileCount === 1 ? "" : "s"}.\n` +
+      `Loaded ${elementSummary} from ${scan.tileCount} scan request${scan.tileCount === 1 ? "" : "s"}.\n` +
       `${scan.fetchedTileCount} new request${scan.fetchedTileCount === 1 ? "" : "s"} fetched; ${scan.reusedTileCount} reused from this tab.\n` +
       `Building feature buckets and scoring in ${canUseScoringWorker() ? "a background worker" : "the main thread"}…`
     );
-    const scored = await scoreOsmData(scan.osmJson, bbox, ids, fetchController.signal);
+    const scored = await scoreOsmData(scan, bbox, ids, fetchController.signal);
     const parsed = scored.parsed;
     lastFeatures = parsed;
     lastProjection = parsed.projection;
@@ -1190,6 +1300,7 @@ async function calculate() {
     setStatus(
       `Gradient complete.\nAverage score: ${avg.toFixed(1)} / 100\nRange: ${min.toFixed(1)}–${max.toFixed(1)}\n` +
       `Scoring: ${scored.usedWorker ? "background worker" : "main thread fallback"} (${Math.round(scored.elapsedMs).toLocaleString()} ms).\n` +
+      (scored.cache ? `Parsed cache: ${scored.cache.tileHits} reused, ${scored.cache.tileMisses} parsed.\n` : "") +
       `Scan requests: ${scan.tileCount} total, ${scan.fetchedTileCount} new, ${scan.reusedTileCount} reused from this tab.\n` +
       `Tab cache: ${scanCache.size} saved scan request${scanCache.size === 1 ? "" : "s"}.\n\nFeatures used:\n${summarizeFeatures(parsed.features)}`
     );
@@ -1206,8 +1317,8 @@ function clearMap() {
   if (activeFetchController) {
     activeFetchController.abort();
     activeFetchController = null;
+    terminateScoringWorker();
   }
-  terminateScoringWorker();
   if (heatLayer) {
     map.removeLayer(heatLayer);
     heatLayer = null;

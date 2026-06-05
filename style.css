@@ -110,6 +110,31 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 
 .inline-toggle { margin-top: 12px; }
 
+.field-label {
+  display: block;
+  margin: 13px 0 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.text-input {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  color: var(--ink);
+  background: #fff;
+  font: inherit;
+  font-size: 13px;
+}
+
+.text-input:focus {
+  outline: 2px solid rgba(33, 110, 69, 0.2);
+  border-color: var(--accent);
+}
+
 .legend {
   display: grid;
   grid-template-columns: auto 1fr auto;

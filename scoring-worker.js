@@ -1,8 +1,11 @@
 const EARTH_RADIUS_M = 6371008.8;
 const DENSIFY_STEP_M = 45;
 const GRID_TARGET_POINTS = 42;
+const DRAFT_GRID_TARGET_POINTS = 18;
 
 let layerDefinitions = {};
+const tileElementKeysCache = new Map();
+const elementFeatureCache = new Map();
 
 self.addEventListener("message", (event) => {
   const message = event.data || {};
@@ -15,16 +18,32 @@ self.addEventListener("message", (event) => {
     self.postMessage({
       type: "progress",
       jobId: message.jobId,
-      message: "Building feature buckets in a background worker...",
+      message: "Building cached feature buckets in a background worker...",
     });
-    const parsed = parseFeatures(message.osmJson, message.bbox);
+    const parsed = message.scanRequests
+      ? parseFeaturesFromScanRequests(message.scanRequests, message.bbox)
+      : parseFeatures(message.osmJson, message.bbox);
 
     self.postMessage({
       type: "progress",
       jobId: message.jobId,
-      message: "Scoring grid points in a background worker...",
+      message: "Scoring a fast draft grid in a background worker...",
     });
-    const grid = scoreGrid(parsed.features, parsed.projection, message.bbox, message.activeLayerIds);
+    const draftGrid = scoreGrid(parsed.features, parsed.projection, message.bbox, message.activeLayerIds, DRAFT_GRID_TARGET_POINTS);
+    self.postMessage({
+      type: "partial",
+      jobId: message.jobId,
+      projectionCenterLat: parsed.projectionCenterLat,
+      grid: draftGrid,
+      gridMeta: draftGrid.meta,
+    });
+
+    self.postMessage({
+      type: "progress",
+      jobId: message.jobId,
+      message: "Refining the full-resolution grid in a background worker...",
+    });
+    const grid = scoreGrid(parsed.features, parsed.projection, message.bbox, message.activeLayerIds, GRID_TARGET_POINTS);
     const gridMeta = grid.meta;
 
     self.postMessage({
@@ -35,6 +54,8 @@ self.addEventListener("message", (event) => {
       grid,
       gridMeta,
       elapsedMs: performance.now() - startedAt,
+      cache: parsed.cache || null,
+      parsedScanKeys: parsed.parsedScanKeys || [],
     });
   } catch (err) {
     self.postMessage({
@@ -44,6 +65,137 @@ self.addEventListener("message", (event) => {
     });
   }
 });
+
+function parseFeaturesFromScanRequests(scanRequests, bbox) {
+  const projectionCenterLat = (bbox.north + bbox.south) / 2;
+  const projection = makeProjection(projectionCenterLat);
+  const elementKeys = new Set();
+  let tileHits = 0;
+  let tileMisses = 0;
+  let elementHits = 0;
+  let elementMisses = 0;
+  const parsedScanKeys = [];
+
+  for (const request of scanRequests || []) {
+    if (tileElementKeysCache.has(request.key)) {
+      tileHits++;
+      for (const key of tileElementKeysCache.get(request.key)) elementKeys.add(key);
+      parsedScanKeys.push(request.key);
+      continue;
+    }
+
+    if (!request.osmJson) {
+      throw new Error("A cached scan request was not available in the worker.");
+    }
+
+    tileMisses++;
+    const tileKeys = [];
+    for (const el of request.osmJson.elements || []) {
+      const key = `${el.type}/${el.id}`;
+      tileKeys.push(key);
+      elementKeys.add(key);
+      if (elementFeatureCache.has(key)) {
+        elementHits++;
+      } else {
+        const feature = parseElementFeature(el);
+        if (feature) {
+          elementFeatureCache.set(key, feature);
+          elementMisses++;
+        }
+      }
+    }
+    tileElementKeysCache.set(request.key, tileKeys);
+    parsedScanKeys.push(request.key);
+  }
+
+  const normalized = emptyFeatureBuckets();
+  for (const key of elementKeys) {
+    const feature = elementFeatureCache.get(key);
+    if (!feature) continue;
+    mergeFeatureBuckets(normalized, feature);
+  }
+
+  return {
+    features: projectFeatureBuckets(normalized, projection),
+    projection,
+    projectionCenterLat,
+    cache: { tileHits, tileMisses, elementHits, elementMisses },
+    parsedScanKeys,
+  };
+}
+
+function parseElementFeature(el) {
+  const tags = el.tags || {};
+  const latlngs = elementLatLngs(el);
+  if (!latlngs.length) return null;
+
+  const feature = emptyFeatureBuckets();
+  const center = averageLatLng(latlngs);
+  const projection = makeProjection(center?.lat || latlngs[0].lat);
+  const isLinear = el.type === "way" && latlngs.length > 1;
+
+  if (isPedestrianWay(tags)) addLatLngPoints(feature.pedestrianNetwork, latlngs, projection, { densify: isLinear });
+  if (isWalkableStreet(tags)) addLatLngPoints(feature.walkableStreets, latlngs, projection, { densify: isLinear });
+  if (tags.highway === "crossing" || tags.crossing) addLatLngPoints(feature.crossings, latlngs.slice(0, 1), projection);
+  const category = destinationCategory(tags);
+  if (category) addLatLngCenterPoint(feature.destinations, latlngs, { category });
+  if (isTransitStop(tags)) addLatLngPoints(feature.transitStops, latlngs.slice(0, 1), projection);
+  if (isGreenSpace(tags)) {
+    addLatLngPoints(feature.greenSpace, latlngs, projection, { densify: isLinear, stepM: 70 });
+    addLatLngCenterPoint(feature.greenSpace, latlngs);
+  }
+  if (hasBikeInfra(tags)) addLatLngPoints(feature.bikeNetwork, latlngs, projection, { densify: isLinear });
+  if (isLowStressBikeStreet(tags)) addLatLngPoints(feature.lowStressBikeStreets, latlngs, projection, { densify: isLinear });
+  if (tags.amenity === "bicycle_parking") addLatLngCenterPoint(feature.bikeParking, latlngs);
+  if (tags.traffic_calming) addLatLngPoints(feature.trafficCalming, latlngs, projection, { densify: isLinear });
+  if (isHighStressRoad(tags)) addLatLngPoints(feature.highStressRoads, latlngs, projection, { densify: isLinear });
+
+  if (isLinear && (isPedestrianWay(tags) || hasBikeInfra(tags) || isHighStressRoad(tags))) {
+    feature.debug.push({ latlngs, tags });
+  }
+
+  return feature;
+}
+
+function mergeFeatureBuckets(target, source) {
+  for (const key of Object.keys(target)) {
+    if (!Array.isArray(source[key]) || !source[key].length) continue;
+    target[key].push(...source[key]);
+  }
+}
+
+function projectFeatureBuckets(normalized, projection) {
+  const features = emptyFeatureBuckets();
+  for (const [key, values] of Object.entries(normalized)) {
+    if (key === "debug") {
+      features.debug.push(...values);
+      continue;
+    }
+    for (const point of values) {
+      features[key].push({ ...point, ...projection.toXY(point.lat, point.lng) });
+    }
+  }
+  return features;
+}
+
+function addLatLngPoints(bucket, latlngs, projection, options = {}) {
+  if (!latlngs.length) return;
+  const points = options.densify
+    ? densifyLatLngPoints(latlngs, projection, options.stepM || DENSIFY_STEP_M)
+    : latlngs.map((p) => ({ lat: p.lat, lng: p.lng }));
+  bucket.push(...points);
+}
+
+function addLatLngCenterPoint(bucket, latlngs, extra = {}) {
+  const center = averageLatLng(latlngs);
+  if (!center) return;
+  bucket.push({ lat: center.lat, lng: center.lng, ...extra });
+}
+
+function densifyLatLngPoints(latlngs, projection, stepM = DENSIFY_STEP_M) {
+  return densifyLatLngs(latlngs, projection, stepM)
+    .map((point) => ({ lat: point.lat, lng: point.lng }));
+}
 
 function makeProjection(centerLat) {
   const lat0 = degToRad(centerLat);
@@ -452,14 +604,14 @@ function layerScore(point, layer) {
   return nearLayerScore(point, layer);
 }
 
-function generateGrid(bbox, projection) {
+function generateGrid(bbox, projection, targetPoints = GRID_TARGET_POINTS) {
   const sw = projection.toXY(bbox.south, bbox.west);
   const se = projection.toXY(bbox.south, bbox.east);
   const nw = projection.toXY(bbox.north, bbox.west);
   const widthM = Math.max(1, Math.abs(se.x - sw.x));
   const heightM = Math.max(1, Math.abs(nw.y - sw.y));
-  const lngCount = GRID_TARGET_POINTS;
-  const latCount = clamp(Math.round((lngCount * heightM) / widthM), 18, 72);
+  const lngCount = targetPoints;
+  const latCount = clamp(Math.round((lngCount * heightM) / widthM), Math.max(10, Math.round(targetPoints * 0.45)), Math.max(24, Math.round(targetPoints * 1.7)));
   const grid = [];
 
   for (let y = 0; y <= latCount; y++) {
@@ -473,8 +625,8 @@ function generateGrid(bbox, projection) {
   return grid;
 }
 
-function scoreGrid(features, projection, bbox, activeLayerIds) {
-  const grid = generateGrid(bbox, projection);
+function scoreGrid(features, projection, bbox, activeLayerIds, targetPoints = GRID_TARGET_POINTS) {
+  const grid = generateGrid(bbox, projection, targetPoints);
   const activeLayers = activeLayerIds
     .map((id) => {
       const definition = layerDefinitions[id];
